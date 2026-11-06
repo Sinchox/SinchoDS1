@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>SinchoDS - Multi-Supplier &amp; eBay Listing Manager</title>
+    <meta name="description" content="SinchoDS - Multi-supplier product sourcing, variant management, profit calculation and official eBay.it listing automation." />
+    <meta property="og:title" content="SinchoDS - Multi-Supplier &amp; eBay Listing Manager" />
+    <meta property="og:description" content="SinchoDS - Multi-supplier product sourcing, variant management, profit calculation and official eBay.it listing automation." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <script>
+      // Suppress Vite HMR WebSocket connection errors in iframe/preview environment
+      window.addEventListener('unhandledrejection', function(event) {
+        if (
+          event.reason &&
+          (
+            (typeof event.reason.message === 'string' && (
+              event.reason.message.includes('WebSocket') ||
+              event.reason.message.includes('ws') ||
+              event.reason.message.includes('vite')
+            )) ||
+            (typeof event.reason.stack === 'string' && (
+              event.reason.stack.includes('@vite/client') ||
+              event.reason.stack.includes('client.mjs') ||
+              event.reason.stack.includes('WebSocket')
+            ))
+          )
+        ) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+        }
+      });
+      window.addEventListener('error', function(event) {
+        if (
+          (event.message && (event.message.includes('WebSocket') || event.message.includes('@vite/client'))) ||
+          (event.filename && event.filename.includes('@vite/client'))
+        ) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+        }
+      });
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+

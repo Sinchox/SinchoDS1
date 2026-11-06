@@ -1,0 +1,7 @@
+{
+  "name": "PlusPower Product Scraper",
+  "description": "Professional product data extraction, variant management, HTML parsing, and CSV export for PlusPower Supplements.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+

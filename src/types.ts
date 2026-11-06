@@ -353,26 +353,220 @@ export interface MonitoringSettings {
   maxRetries: number; // default 3
 }
 
+export type OrderStatus =
+  | 'pending'
+  | 'awaiting_purchase'
+  | 'awaiting_dispatch'
+  | 'purchased'
+  | 'shipped'
+  | 'delivered'
+  | 'returned'
+  | 'cancelled'
+  | 'pending_fulfillment'
+  | 'fulfilled'
+  | 'refunded';
+
+export type SupplierPurchasingStatus =
+  | 'not_purchased'
+  | 'ordered'
+  | 'confirmed'
+  | 'failed';
+
+export type DeliveryStatus =
+  | 'unfulfilled'
+  | 'in_transit'
+  | 'delivered'
+  | 'failed_delivery'
+  | 'returned';
+
+export type ReturnStatus =
+  | 'none'
+  | 'requested'
+  | 'approved'
+  | 'item_received'
+  | 'completed'
+  | 'rejected';
+
+export interface OrderLineItem {
+  id: string;
+  order_id?: string;
+  product_id?: string;
+  variant_id?: string | null;
+  title: string;
+  variant_name?: string;
+  sku?: string;
+  ean?: string;
+  quantity: number;
+  purchase_cost: number;
+  selling_price: number;
+  supplier_id?: string;
+  supplier_name?: string;
+  supplier_url?: string;
+  supplier_order_reference?: string | null;
+  supplier_status?: 'not_ordered' | 'ordered' | 'shipped' | 'cancelled';
+  // Backwards compatibility aliases
+  sale_price?: number;
+  supplier_cost?: number;
+}
+
+export interface OrderEvent {
+  id: string;
+  order_id: string;
+  timestamp: string;
+  actor?: string;
+  event_type:
+    | 'created'
+    | 'status_changed'
+    | 'supplier_updated'
+    | 'fulfillment_updated'
+    | 'tracking_added'
+    | 'delivered'
+    | 'return_requested'
+    | 'return_status_changed'
+    | 'refund_issued'
+    | 'cancelled'
+    | 'edited'
+    | 'note_added';
+  description: string;
+  data?: Record<string, any>;
+}
+
+export interface OrderRefundItem {
+  id: string;
+  amount: number;
+  reason?: string;
+  timestamp: string;
+  actor?: string;
+}
+
+export interface OrderShippingAddress {
+  name?: string;
+  address_line1?: string;
+  address_line2?: string;
+  city?: string;
+  state_province?: string;
+  postal_code?: string;
+  country?: string;
+  phone?: string;
+}
+
+export interface OrderFinancials {
+  itemsTotalSelling: number;
+  items_total_selling?: number;
+  shippingChargedToBuyer: number;
+  shipping_charged_to_buyer?: number;
+  totalRevenue: number;
+  total_revenue?: number;
+  itemsTotalCost: number;
+  items_total_cost?: number;
+  total_supplier_cost?: number;
+  supplierShippingCost: number;
+  supplier_shipping_cost?: number;
+  packagingCost: number;
+  packaging_cost?: number;
+  totalCost: number;
+  total_cost?: number;
+  estimatedEbayFees: number;
+  estimated_ebay_fees?: number;
+  totalRefunds: number;
+  refunds_amount?: number;
+  total_refunds?: number;
+  netProfit: number;
+  net_profit?: number;
+  profitMargin: number;
+  profit_margin?: number;
+}
+
 export interface Order {
   id: string;
-  ebay_order_id: string;
-  created_at: string;
-  buyer_username: string;
-  total_paid: number;
+  workspace_id?: string;
+  order_number?: string;
+  external_order_id?: string | null;
+  ebay_order_id?: string | null;
+  order_source?: 'manual' | 'ebay_sync' | 'external';
+  
+  // Buyer
+  buyer_username?: string;
+  buyer_name?: string;
+  buyer_email?: string;
+  buyer_phone?: string;
+  shipping_address?: OrderShippingAddress;
+
+  // Statuses
+  status: OrderStatus;
+  supplier_purchasing_status?: SupplierPurchasingStatus;
+  delivery_status?: DeliveryStatus;
+
+  // Items
+  items: OrderLineItem[];
+
+  // Financials
   currency: string;
-  status: 'pending_fulfillment' | 'fulfilled' | 'cancelled' | 'refunded';
-  items: {
-    product_id: string;
-    title: string;
-    variant_name?: string;
-    sku: string;
-    quantity: number;
-    sale_price: number;
-    supplier_cost: number;
-    supplier_url: string;
-  }[];
-  tracking_number?: string | null;
+  total_paid?: number; // total revenue alias
+  shipping_charged_to_buyer?: number;
+  supplier_shipping_cost?: number;
+  packaging_cost?: number;
+  estimated_ebay_fees?: number;
+  total_cost?: number;
+  net_profit?: number;
+  profit_margin?: number;
+
+  // Supplier
+  supplier_id?: string;
+  supplier_name?: string;
+  supplier_order_reference?: string | null;
+  supplier_purchased_at?: string | null;
+  supplier_notes?: string | null;
+
+  // Fulfillment
   carrier?: string | null;
+  tracking_number?: string | null;
+  tracking_url?: string | null;
+  dispatched_at?: string | null;
+  delivered_at?: string | null;
+
+  // Returns, Refunds & Cancellation
+  cancellation_reason?: string | null;
+  cancelled_at?: string | null;
+  return_status?: ReturnStatus;
+  return_reason?: string | null;
+  returned_at?: string | null;
+  refund_amount?: number;
+  refund_reason?: string | null;
+  refunded_at?: string | null;
+  refunds?: OrderRefundItem[];
+
+  // History & Notes
+  events?: OrderEvent[];
+  notes?: string | null;
+
+  created_at: string;
+  updated_at?: string;
+}
+
+export interface OrderSummaryStats {
+  totalOrders: number;
+  total_orders?: number;
+  pendingCount: number;
+  pending_orders?: number;
+  awaitingPurchaseCount: number;
+  awaiting_supplier_purchase?: number;
+  awaitingDispatchCount: number;
+  awaiting_dispatch?: number;
+  shippedCount: number;
+  shipped_orders?: number;
+  deliveredCount: number;
+  delivered_orders?: number;
+  returnedCount: number;
+  returned_orders?: number;
+  cancelledCount: number;
+  cancelled_orders?: number;
+  totalRevenue: number;
+  total_revenue?: number;
+  totalSupplierCost: number;
+  total_supplier_cost?: number;
+  totalProfit: number;
+  total_net_profit?: number;
 }
 
 export interface ScrapingJobItem {
@@ -405,4 +599,130 @@ export interface ScraperSettings {
   ebayConfig: EbayAccountConfig;
   defaultPricingRule: PricingRule;
   monitoringSettings?: MonitoringSettings;
+}
+
+// ==============================================================================
+// Phase 1.6B: Financial Dashboard & Profit Analytics Models
+// ==============================================================================
+
+export type DateRangePreset = 'today' | 'this_week' | 'this_month' | 'previous_month' | 'custom' | 'all';
+
+export interface FinancialDateRange {
+  preset: DateRangePreset;
+  startDate: string; // ISO string or YYYY-MM-DD
+  endDate: string;   // ISO string or YYYY-MM-DD
+  label: string;
+}
+
+export interface FinancialSummary {
+  currency: string; // default EUR
+  totalRevenue: number;
+  totalSupplierCost: number;
+  shippingChargedToBuyer: number;
+  supplierShippingCost: number;
+  packagingCost: number;
+  totalShippingPackagingCost: number;
+  estimatedEbayFees: number;
+  confirmedEbayFees: number;
+  totalRefunds: number;
+  netProfit: number;
+  profitMargin: number;
+  totalOrders: number;
+  completedOrdersCount: number;
+  cancelledOrdersCount: number;
+  averageOrderValue: number;
+  averageOrderProfit: number;
+  lossMakingOrdersCount: number;
+}
+
+export interface ProductPerformanceItem {
+  productId?: string;
+  sku?: string;
+  title: string;
+  variantName?: string;
+  supplierId?: string;
+  supplierName?: string;
+  unitsSold: number;
+  totalRevenue: number;
+  totalCost: number;
+  totalProfit: number;
+  profitMargin: number;
+}
+
+export interface SupplierCostBreakdown {
+  supplierId: string;
+  supplierName: string;
+  ordersCount: number;
+  unitsSold: number;
+  totalRevenue: number;
+  totalCost: number;
+  totalProfit: number;
+  profitMargin: number;
+}
+
+export interface LossMakingOrder {
+  orderId: string;
+  orderNumber: string;
+  buyerName?: string;
+  date: string;
+  revenue: number;
+  supplierCost: number;
+  shippingAndPackagingCost: number;
+  estimatedEbayFees: number;
+  refunds: number;
+  netLoss: number; // positive number representing the loss
+  lossReason: string;
+}
+
+export interface CancellationReasonBreakdown {
+  reason: string;
+  count: number;
+  percentage: number;
+  potentialRevenueLost: number;
+}
+
+export interface CancellationAnalysis {
+  cancelledOrdersCount: number;
+  completedOrdersCount: number;
+  cancellationRate: number; // percentage
+  potentialRevenueLost: number;
+  reasons: CancellationReasonBreakdown[];
+  totalRefundsAmount: number;
+  refundsCount: number;
+}
+
+export interface FinancialTrendItem {
+  date: string; // YYYY-MM-DD
+  label: string; // Short Italian label, e.g. "04 Nov"
+  revenue: number;
+  costs: number;
+  profit: number;
+  ordersCount: number;
+}
+
+export interface FinancialComparisonPeriod {
+  currentRevenue: number;
+  previousRevenue: number;
+  revenueGrowthPercent: number;
+  currentProfit: number;
+  previousProfit: number;
+  profitGrowthPercent: number;
+  currentOrdersCount: number;
+  previousOrdersCount: number;
+  ordersGrowthPercent: number;
+}
+
+export interface FinancialReport {
+  workspaceId?: string;
+  generatedAt: string;
+  currency: string; // 'EUR'
+  dateRange: FinancialDateRange;
+  summary: FinancialSummary;
+  trends: FinancialTrendItem[];
+  comparison?: FinancialComparisonPeriod;
+  bestSellingProducts: ProductPerformanceItem[];
+  mostProfitableProducts: ProductPerformanceItem[];
+  supplierComparisons: SupplierCostBreakdown[];
+  lossMakingOrders: LossMakingOrder[];
+  cancellationAnalysis: CancellationAnalysis;
 }

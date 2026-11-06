@@ -14,16 +14,19 @@ import {
   AlertTriangle,
   Info,
   Check,
+  ShoppingBag,
+  TrendingUp,
 } from 'lucide-react';
 import { Notification } from '../types.js';
 
-export type PageId = 'dashboard' | 'products' | 'suppliers' | 'listings' | 'scraper' | 'html-import' | 'settings';
+export type PageId = 'dashboard' | 'orders' | 'financials' | 'products' | 'suppliers' | 'listings' | 'scraper' | 'html-import' | 'settings';
 
 interface NavbarProps {
   currentPage: PageId;
   setCurrentPage: (page: PageId) => void;
   productsCount: number;
   listingsCount: number;
+  ordersCount?: number;
   isSupabaseConnected: boolean;
   isEbayConnected: boolean;
 }
@@ -33,6 +36,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   setCurrentPage,
   productsCount,
   listingsCount,
+  ordersCount = 0,
   isSupabaseConnected,
   isEbayConnected,
 }) => {
@@ -84,6 +88,8 @@ export const Navbar: React.FC<NavbarProps> = ({
 
   const navItems = [
     { id: 'dashboard' as PageId, label: 'Dashboard', icon: LayoutDashboard },
+    { id: 'orders' as PageId, label: 'Ordini', icon: ShoppingBag, badge: ordersCount },
+    { id: 'financials' as PageId, label: 'Finanze', icon: TrendingUp },
     { id: 'products' as PageId, label: 'Prodotti', icon: Package, badge: productsCount },
     { id: 'suppliers' as PageId, label: 'Fornitori', icon: Layers },
     { id: 'listings' as PageId, label: 'Inserzioni', icon: Store, badge: listingsCount },
@@ -318,8 +324,8 @@ export const Navbar: React.FC<NavbarProps> = ({
       )}
 
       {/* Mobile Bottom Navigation Bar (iPhone-First) */}
-      <nav className="md:hidden fixed bottom-0 left-0 right-0 z-40 bg-slate-900/95 backdrop-blur-md border-t border-slate-800 pb-[env(safe-area-inset-bottom,8px)] pt-2 px-2">
-        <div className="grid grid-cols-7 gap-0.5">
+      <nav className="md:hidden fixed bottom-0 left-0 right-0 z-40 bg-slate-900/95 backdrop-blur-md border-t border-slate-800 pb-[env(safe-area-inset-bottom,8px)] pt-2 px-1">
+        <div className="grid grid-cols-9 gap-0.5">
           {navItems.map((item) => {
             const Icon = item.icon;
             const isActive = currentPage === item.id;

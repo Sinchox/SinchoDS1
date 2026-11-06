@@ -1,6 +1,6 @@
 {
-  "name": "PlusPower Product Scraper",
-  "description": "Professional product data extraction, variant management, HTML parsing, and CSV export for PlusPower Supplements.",
+  "name": "SinchoDS - Multi-Supplier & eBay Listing Manager",
+  "description": "Multi-supplier product sourcing, variant management, profit calculation, and official eBay.it listing automation.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

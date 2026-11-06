@@ -202,6 +202,87 @@ export function generateCombinedCsv(products: Product[]): string {
 }
 
 /**
+ * Generates RFC 4180 CSV string for transaction-level financial records.
+ * Accurately exports order revenue, product purchase cost, supplier shipping,
+ * packaging, estimated eBay fees, refunds, and final net profit.
+ */
+export function generateFinancialOrdersCsv(orders: Order[]): string {
+  const headers = [
+    'Numero Ordine',
+    'ID Ordine Esterno',
+    'Data Ordine',
+    'Stato Ordine',
+    'Stato Consegna',
+    'Fornitore',
+    'Rif. Ordine Fornitore',
+    'Acquirente',
+    'Valuta',
+    'Ricavi Ordine (EUR)',
+    'Spedizione Pagata da Acquirente (EUR)',
+    'Costo Acquisto Prodotti (EUR)',
+    'Spedizione Fornitore (EUR)',
+    'Packaging (EUR)',
+    'Costo Totale Fornitura (EUR)',
+    'Commissioni eBay Stimate (EUR)',
+    'Rimborsi Emessi (EUR)',
+    'Utile Netto Finale (EUR)',
+    'Margine Profitto %',
+    'Corriere',
+    'Tracking',
+    'Motivo Annullamento / Reso',
+  ];
+
+  const rows = orders.map((o) => {
+    let productPurchaseCost = 0;
+    if (Array.isArray(o.items)) {
+      for (const item of o.items) {
+        const qty = Math.max(1, Number(item.quantity) || 1);
+        const cost = Number(item.purchase_cost ?? item.supplier_cost) || 0;
+        productPurchaseCost += cost * qty;
+      }
+    }
+
+    const revenue = Number(o.total_paid) || 0;
+    const shippingCharged = Number(o.shipping_charged_to_buyer) || 0;
+    const supplierShipping = Number(o.supplier_shipping_cost) || 0;
+    const packaging = Number(o.packaging_cost) || 0;
+    const totalCost = Number(o.total_cost) || 0;
+    const fees = Number(o.estimated_ebay_fees) || 0;
+    const refunds = Number(o.refund_amount) || 0;
+    const netProfit = Number(o.net_profit) || 0;
+    const margin = Number(o.profit_margin) || 0;
+
+    return [
+      o.order_number || o.id,
+      o.external_order_id || '',
+      o.created_at || '',
+      o.status,
+      o.delivery_status || 'unfulfilled',
+      o.supplier_name || o.supplier_id || '',
+      o.supplier_order_reference || '',
+      o.buyer_name || o.buyer_username || '',
+      o.currency || 'EUR',
+      revenue.toFixed(2),
+      shippingCharged.toFixed(2),
+      productPurchaseCost.toFixed(2),
+      supplierShipping.toFixed(2),
+      packaging.toFixed(2),
+      totalCost.toFixed(2),
+      fees.toFixed(2),
+      refunds.toFixed(2),
+      netProfit.toFixed(2),
+      margin.toFixed(2) + '%',
+      o.carrier || '',
+      o.tracking_number || '',
+      o.cancellation_reason || o.return_reason || '',
+    ];
+  });
+
+  const csvContent = [headers.join(','), ...rows.map((row) => row.map(escapeCsvCell).join(','))].join('\r\n');
+  return '\uFEFF' + csvContent;
+}
+
+/**
  * Triggers native browser download for CSV string.
  */
 export function downloadCsv(filename: string, content: string): void {
@@ -216,3 +297,4 @@ export function downloadCsv(filename: string, content: string): void {
   document.body.removeChild(link);
   URL.revokeObjectURL(url);
 }
+

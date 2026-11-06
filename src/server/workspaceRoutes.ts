@@ -34,7 +34,18 @@ import {
   saveWorkspaceEbayListing,
   deleteWorkspaceEbayListing,
   listWorkspaceOrders,
+  getWorkspaceOrder,
   saveWorkspaceOrder,
+  createWorkspaceOrder,
+  cancelWorkspaceOrder,
+  updateOrderFulfillment,
+  updateOrderSupplierPurchase,
+  recordOrderReturn,
+  recordOrderRefund,
+  deleteWorkspaceOrder,
+  getWorkspaceOrderSummaryStats,
+  getWorkspaceFinancialReport,
+  exportWorkspaceFinancialOrdersCsv,
   listWorkspacePriceHistory,
   recordWorkspacePriceChange,
   approveWorkspacePriceChange,
@@ -815,19 +826,44 @@ workspaceRouter.delete(
 );
 
 // ==============================================================================
-// 5. ORDERS
+// 5. ORDERS & FULFILLMENT FOUNDATION (Phase 1.6A)
 // ==============================================================================
 
 /**
+ * GET /api/orders/summary/stats
+ */
+workspaceRouter.get(
+  '/orders/summary/stats',
+  requireWorkspaceContext({ minRole: 'viewer' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const stats = await getWorkspaceOrderSummaryStats(req.workspace!.id);
+      res.json({ ok: true, stats, workspaceId: req.workspace!.id });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error fetching order summary statistics' });
+    }
+  }
+);
+
+/**
  * GET /api/orders
+ * Supports query filters: status, supplierId, deliveryStatus, startDate, endDate, search
  */
 workspaceRouter.get(
   '/orders',
   requireWorkspaceContext({ minRole: 'viewer' }),
   async (req: AuthenticatedWorkspaceRequest, res: Response) => {
     try {
-      const orders = await listWorkspaceOrders(req.workspace!.id);
-      res.json({ ok: true, orders, workspaceId: req.workspace!.id });
+      const { status, supplierId, deliveryStatus, startDate, endDate, search } = req.query;
+      const orders = await listWorkspaceOrders(req.workspace!.id, {
+        status: status as string,
+        supplierId: supplierId as string,
+        deliveryStatus: deliveryStatus as string,
+        startDate: startDate as string,
+        endDate: endDate as string,
+        search: search as string,
+      });
+      res.json({ ok: true, orders, workspaceId: req.workspace!.id, total: orders.length });
     } catch (err: any) {
       res.status(500).json({ ok: false, error: err.message || 'Error fetching orders' });
     }
@@ -835,7 +871,28 @@ workspaceRouter.get(
 );
 
 /**
+ * GET /api/orders/:id
+ */
+workspaceRouter.get(
+  '/orders/:id',
+  requireWorkspaceContext({ minRole: 'viewer' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const order = await getWorkspaceOrder(req.workspace!.id, req.params.id);
+      if (!order) {
+        res.status(404).json({ ok: false, error: 'Order not found in this workspace' });
+        return;
+      }
+      res.json({ ok: true, order, workspaceId: req.workspace!.id });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error fetching order' });
+    }
+  }
+);
+
+/**
  * POST /api/orders
+ * Create new order (manager, admin, or owner)
  */
 workspaceRouter.post(
   '/orders',
@@ -843,19 +900,241 @@ workspaceRouter.post(
   async (req: AuthenticatedWorkspaceRequest, res: Response) => {
     try {
       const order = req.body?.order || req.body;
-      if (!order || !order.id) {
+      if (!order) {
         res.status(400).json({ ok: false, error: 'Order payload is required.' });
         return;
       }
 
-      const result = await saveWorkspaceOrder(req.workspace!.id, order);
+      const actor = req.user?.id || req.user?.email || 'manager';
+      const result = await createWorkspaceOrder(req.workspace!.id, order, actor);
+
+      if (!result.ok) {
+        const isConflict = result.error?.includes('Duplicate external order ID');
+        res.status(isConflict ? 409 : 400).json({ ok: false, error: result.error });
+        return;
+      }
+      res.json({ ok: true, order: result.order, workspaceId: req.workspace!.id });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error creating order' });
+    }
+  }
+);
+
+/**
+ * PUT /api/orders/:id
+ * Update existing order (manager, admin, or owner)
+ */
+workspaceRouter.put(
+  '/orders/:id',
+  requireWorkspaceContext({ minRole: 'manager' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const updates = req.body?.order || req.body;
+      updates.id = req.params.id;
+
+      const actor = req.user?.id || req.user?.email || 'manager';
+      const result = await saveWorkspaceOrder(req.workspace!.id, updates, actor);
+
+      if (!result.ok) {
+        const isConflict = result.error?.includes('Duplicate external order ID');
+        res.status(isConflict ? 409 : 400).json({ ok: false, error: result.error });
+        return;
+      }
+      res.json({ ok: true, order: result.order, workspaceId: req.workspace!.id });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error updating order' });
+    }
+  }
+);
+
+/**
+ * POST /api/orders/:id/cancel
+ * Cancel order with reason
+ */
+workspaceRouter.post(
+  '/orders/:id/cancel',
+  requireWorkspaceContext({ minRole: 'manager' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const reason = req.body?.reason || req.body?.cancellation_reason || 'Annullato manualmente';
+      const actor = req.user?.id || req.user?.email || 'manager';
+
+      const result = await cancelWorkspaceOrder(req.workspace!.id, req.params.id, reason, actor);
       if (!result.ok) {
         res.status(400).json({ ok: false, error: result.error });
         return;
       }
-      res.json({ ok: true, order: result.order });
+      res.json({ ok: true, order: result.order, message: 'Order successfully cancelled' });
     } catch (err: any) {
-      res.status(500).json({ ok: false, error: err.message || 'Error saving order' });
+      res.status(500).json({ ok: false, error: err.message || 'Error cancelling order' });
+    }
+  }
+);
+
+/**
+ * POST /api/orders/:id/fulfillment
+ * Update manual fulfillment (carrier, tracking, delivery status)
+ */
+workspaceRouter.post(
+  '/orders/:id/fulfillment',
+  requireWorkspaceContext({ minRole: 'manager' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const fulfillment = req.body?.fulfillment || req.body;
+      const actor = req.user?.id || req.user?.email || 'manager';
+
+      const result = await updateOrderFulfillment(req.workspace!.id, req.params.id, fulfillment, actor);
+      if (!result.ok) {
+        res.status(400).json({ ok: false, error: result.error });
+        return;
+      }
+      res.json({ ok: true, order: result.order, message: 'Fulfillment successfully updated' });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error updating fulfillment' });
+    }
+  }
+);
+
+/**
+ * POST /api/orders/:id/supplier-purchase
+ * Record supplier purchase reference and status
+ */
+workspaceRouter.post(
+  '/orders/:id/supplier-purchase',
+  requireWorkspaceContext({ minRole: 'manager' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const supplierData = req.body?.supplierData || req.body;
+      const actor = req.user?.id || req.user?.email || 'manager';
+
+      const result = await updateOrderSupplierPurchase(req.workspace!.id, req.params.id, supplierData, actor);
+      if (!result.ok) {
+        res.status(400).json({ ok: false, error: result.error });
+        return;
+      }
+      res.json({ ok: true, order: result.order, message: 'Supplier purchase recorded' });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error updating supplier purchase' });
+    }
+  }
+);
+
+/**
+ * POST /api/orders/:id/return
+ * Record customer return
+ */
+workspaceRouter.post(
+  '/orders/:id/return',
+  requireWorkspaceContext({ minRole: 'manager' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const returnData = req.body?.returnData || req.body;
+      const actor = req.user?.id || req.user?.email || 'manager';
+
+      const result = await recordOrderReturn(req.workspace!.id, req.params.id, returnData, actor);
+      if (!result.ok) {
+        res.status(400).json({ ok: false, error: result.error });
+        return;
+      }
+      res.json({ ok: true, order: result.order, message: 'Return recorded' });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error recording return' });
+    }
+  }
+);
+
+/**
+ * POST /api/orders/:id/refund
+ * Record customer refund
+ */
+workspaceRouter.post(
+  '/orders/:id/refund',
+  requireWorkspaceContext({ minRole: 'manager' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const refundData = req.body?.refundData || req.body;
+      const actor = req.user?.id || req.user?.email || 'manager';
+
+      const result = await recordOrderRefund(req.workspace!.id, req.params.id, refundData, actor);
+      if (!result.ok) {
+        res.status(400).json({ ok: false, error: result.error });
+        return;
+      }
+      res.json({ ok: true, order: result.order, message: 'Refund recorded' });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error recording refund' });
+    }
+  }
+);
+
+/**
+ * DELETE /api/orders/:id
+ * Delete order (admin or owner only)
+ */
+workspaceRouter.delete(
+  '/orders/:id',
+  requireWorkspaceContext({ minRole: 'admin' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const deleted = await deleteWorkspaceOrder(req.workspace!.id, req.params.id);
+      if (!deleted) {
+        res.status(404).json({ ok: false, error: 'Order not found in this workspace' });
+        return;
+      }
+      res.json({ ok: true, message: 'Order successfully deleted from workspace' });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error deleting order' });
+    }
+  }
+);
+
+// ==============================================================================
+// 5B. FINANCIAL REPORTING & PROFIT ANALYTICS (Phase 1.6B)
+// ==============================================================================
+
+/**
+ * GET /api/financials/report
+ * Returns comprehensive workspace financial analytics filtered by date preset or range.
+ */
+workspaceRouter.get(
+  '/financials/report',
+  requireWorkspaceContext({ minRole: 'viewer' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const { range, startDate, endDate } = req.query;
+      const report = await getWorkspaceFinancialReport(req.workspace!.id, {
+        range: (range as any) || 'this_month',
+        startDate: startDate as string,
+        endDate: endDate as string,
+      });
+      res.json({ ok: true, report, workspaceId: req.workspace!.id });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error generating financial report' });
+    }
+  }
+);
+
+/**
+ * GET /api/financials/export-csv
+ * Exports RFC 4180 CSV with transaction-level financial records.
+ */
+workspaceRouter.get(
+  '/financials/export-csv',
+  requireWorkspaceContext({ minRole: 'viewer' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const { range, startDate, endDate } = req.query;
+      const result = await exportWorkspaceFinancialOrdersCsv(req.workspace!.id, {
+        range: (range as any) || 'this_month',
+        startDate: startDate as string,
+        endDate: endDate as string,
+      });
+
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="${result.filename}"`);
+      res.status(200).send(result.csv);
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error exporting financial CSV' });
     }
   }
 );

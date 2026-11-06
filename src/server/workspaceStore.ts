@@ -7,9 +7,22 @@ import {
   ImportJobItem,
   EbayListing,
   Order,
+  OrderLineItem,
+  OrderEvent,
+  OrderRefundItem,
+  OrderStatus,
+  SupplierPurchasingStatus,
+  DeliveryStatus,
+  ReturnStatus,
+  OrderSummaryStats,
   PriceHistoryItem,
   ImportHistoryItem,
+  FinancialReport,
+  DateRangePreset,
 } from '../types.js';
+import { calculateOrderFinancials } from '../utils/pricing.js';
+import { computeFinancialReport, getDateRangeBoundaries } from '../utils/financials.js';
+import { generateFinancialOrdersCsv } from '../utils/csv.js';
 import { INITIAL_SUPPLIERS } from '../utils/suppliers.js';
 import {
   parseProductWithSupplierFallback,
@@ -1231,10 +1244,123 @@ export async function deleteWorkspaceEbayListing(workspaceId: string, listingId:
 }
 
 // ==============================================================================
-// 5. ORDERS
+// 5. ORDERS & FULFILLMENT FOUNDATION (Phase 1.6A)
 // ==============================================================================
 
-export async function listWorkspaceOrders(workspaceId: string): Promise<Order[]> {
+export interface OrderFilters {
+  status?: string;
+  supplierId?: string;
+  deliveryStatus?: string;
+  startDate?: string;
+  endDate?: string;
+  search?: string;
+}
+
+export async function listWorkspaceOrders(
+  workspaceId: string,
+  filters?: OrderFilters
+): Promise<Order[]> {
+  let allOrders: Order[] = [];
+
+  const config = getWorkspaceConfig();
+  if (config.supabaseUrl && config.serviceRoleKey) {
+    try {
+      const client = createServiceRoleClient(config.supabaseUrl, config.serviceRoleKey);
+      if (client) {
+        let query = client
+          .from('orders')
+          .select('*')
+          .eq('workspace_id', workspaceId)
+          .order('created_at', { ascending: false });
+
+        if (filters?.status && filters.status !== 'all') {
+          query = query.eq('status', filters.status);
+        }
+        if (filters?.supplierId && filters.supplierId !== 'all') {
+          query = query.eq('supplier_id', filters.supplierId);
+        }
+        if (filters?.deliveryStatus && filters.deliveryStatus !== 'all') {
+          query = query.eq('delivery_status', filters.deliveryStatus);
+        }
+        if (filters?.startDate) {
+          query = query.gte('created_at', filters.startDate);
+        }
+        if (filters?.endDate) {
+          query = query.lte('created_at', filters.endDate);
+        }
+
+        const { data, error } = await query;
+        if (!error && Array.isArray(data)) {
+          allOrders = data.map((row: any) => normalizeOrderRecord(row));
+        }
+      }
+    } catch {
+      // Fallback
+    }
+  }
+
+  if (allOrders.length === 0) {
+    allOrders = [...(workspaceOrdersStore.get(workspaceId) || [])];
+  }
+
+  // Apply filters to in-memory/results
+  if (filters) {
+    const { status, supplierId, deliveryStatus, startDate, endDate, search } = filters;
+    allOrders = allOrders.filter((order) => {
+      if (status && status !== 'all') {
+        if (order.status !== status) return false;
+      }
+      if (supplierId && supplierId !== 'all') {
+        const matchesOrder = order.supplier_id === supplierId;
+        const matchesItem = order.items?.some((i) => i.supplier_id === supplierId);
+        if (!matchesOrder && !matchesItem) return false;
+      }
+      if (deliveryStatus && deliveryStatus !== 'all') {
+        if (order.delivery_status !== deliveryStatus) return false;
+      }
+      if (startDate) {
+        if (new Date(order.created_at).getTime() < new Date(startDate).getTime()) return false;
+      }
+      if (endDate) {
+        if (new Date(order.created_at).getTime() > new Date(endDate).getTime()) return false;
+      }
+      if (search && search.trim()) {
+        const q = search.trim().toLowerCase();
+        const matchesNumber = order.order_number?.toLowerCase().includes(q);
+        const matchesExternal = order.external_order_id?.toLowerCase().includes(q);
+        const matchesEbay = order.ebay_order_id?.toLowerCase().includes(q);
+        const matchesBuyer = (
+          (order.buyer_name || '') +
+          ' ' +
+          (order.buyer_username || '') +
+          ' ' +
+          (order.buyer_email || '')
+        ).toLowerCase().includes(q);
+        const matchesTracking = order.tracking_number?.toLowerCase().includes(q);
+        const matchesSupplierRef = order.supplier_order_reference?.toLowerCase().includes(q);
+        const matchesItems = order.items?.some(
+          (i) =>
+            i.title?.toLowerCase().includes(q) ||
+            i.sku?.toLowerCase().includes(q) ||
+            i.ean?.toLowerCase().includes(q) ||
+            i.variant_name?.toLowerCase().includes(q)
+        );
+
+        if (!matchesNumber && !matchesExternal && !matchesEbay && !matchesBuyer && !matchesTracking && !matchesSupplierRef && !matchesItems) {
+          return false;
+        }
+      }
+      return true;
+    });
+  }
+
+  return allOrders;
+}
+
+export async function getWorkspaceOrder(
+  workspaceId: string,
+  orderId: string
+): Promise<Order | null> {
   const config = getWorkspaceConfig();
   if (config.supabaseUrl && config.serviceRoleKey) {
     try {
@@ -1244,10 +1370,11 @@ export async function listWorkspaceOrders(workspaceId: string): Promise<Order[]>
           .from('orders')
           .select('*')
           .eq('workspace_id', workspaceId)
-          .order('created_at', { ascending: false });
+          .eq('id', orderId)
+          .maybeSingle();
 
-        if (!error && Array.isArray(data)) {
-          return data;
+        if (!error && data) {
+          return normalizeOrderRecord(data);
         }
       }
     } catch {
@@ -1255,18 +1382,195 @@ export async function listWorkspaceOrders(workspaceId: string): Promise<Order[]>
     }
   }
 
-  return [...(workspaceOrdersStore.get(workspaceId) || [])];
+  const list = workspaceOrdersStore.get(workspaceId) || [];
+  return list.find((o) => o.id === orderId) || null;
 }
 
 export async function saveWorkspaceOrder(
   workspaceId: string,
-  order: Order
-): Promise<{ ok: boolean; order: Order; error?: string }> {
+  order: Partial<Order>,
+  actor?: string
+): Promise<{ ok: boolean; order?: Order; error?: string }> {
+  const orderId = order.id || (crypto.randomUUID ? crypto.randomUUID() : `ord-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`);
+
+  // Normalize items
+  const rawItems = Array.isArray(order.items) ? order.items : [];
+  const normalizedItems: OrderLineItem[] = rawItems.map((item, idx) => {
+    const qty = Math.max(1, Number(item.quantity) || 1);
+    const cost = Math.max(0, Number(item.purchase_cost ?? item.supplier_cost) || 0);
+    const price = Math.max(0, Number(item.selling_price ?? item.sale_price) || 0);
+    return {
+      ...item,
+      id: item.id || `item-${orderId}-${idx + 1}`,
+      order_id: orderId,
+      quantity: qty,
+      purchase_cost: cost,
+      selling_price: price,
+      supplier_cost: cost,
+      sale_price: price,
+      supplier_status: item.supplier_status || 'not_ordered',
+    };
+  });
+
+  // Calculate order-level financials
+  const financials = calculateOrderFinancials(normalizedItems, {
+    shippingChargedToBuyer: order.shipping_charged_to_buyer,
+    supplierShippingCost: order.supplier_shipping_cost,
+    packagingCost: order.packaging_cost,
+    refundAmount: order.refund_amount,
+  });
+
+  // Check duplicate external_order_id in same workspace
+  const externalId = (order.external_order_id || '').trim();
+  if (externalId) {
+    // 1. In Supabase
+    const config = getWorkspaceConfig();
+    if (config.supabaseUrl && config.serviceRoleKey) {
+      try {
+        const client = createServiceRoleClient(config.supabaseUrl, config.serviceRoleKey);
+        if (client) {
+          const { data, error } = await client
+            .from('orders')
+            .select('id')
+            .eq('workspace_id', workspaceId)
+            .eq('external_order_id', externalId)
+            .neq('id', orderId)
+            .maybeSingle();
+
+          if (!error && data) {
+            return {
+              ok: false,
+              error: `Duplicate external order ID "${externalId}" already exists in this workspace.`,
+            };
+          }
+        }
+      } catch {
+        // Fallback
+      }
+    }
+
+    // 2. In-memory
+    const existingList = workspaceOrdersStore.get(workspaceId) || [];
+    const duplicate = existingList.find(
+      (o) => o.id !== orderId && o.external_order_id?.trim().toLowerCase() === externalId.toLowerCase()
+    );
+    if (duplicate) {
+      return {
+        ok: false,
+        error: `Duplicate external order ID "${externalId}" already exists in this workspace.`,
+      };
+    }
+  }
+
+  // Check if updating existing order to preserve created_at and audit trail
+  const existingOrder = await getWorkspaceOrder(workspaceId, orderId);
+  const now = new Date().toISOString();
+  const createdAt = existingOrder ? existingOrder.created_at : order.created_at || now;
+
+  // Audit events
+  const events: OrderEvent[] = Array.isArray(order.events)
+    ? [...order.events]
+    : existingOrder?.events
+    ? [...existingOrder.events]
+    : [];
+
+  if (!existingOrder) {
+    events.unshift({
+      id: crypto.randomUUID ? crypto.randomUUID() : `evt-${Date.now()}-1`,
+      order_id: orderId,
+      timestamp: now,
+      actor: actor || 'system',
+      event_type: 'created',
+      description: 'Ordine creato manualmente',
+      data: {
+        itemCount: normalizedItems.length,
+        totalRevenue: financials.totalRevenue,
+      },
+    });
+  }
+
+  // Detect status change for audit log
+  if (existingOrder && order.status && order.status !== existingOrder.status) {
+    events.unshift({
+      id: crypto.randomUUID ? crypto.randomUUID() : `evt-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      order_id: orderId,
+      timestamp: now,
+      actor: actor || 'system',
+      event_type: 'status_changed',
+      description: `Stato ordine modificato da ${existingOrder.status} a ${order.status}`,
+      data: { oldStatus: existingOrder.status, newStatus: order.status },
+    });
+  }
+
+  // Derive supplier_id if not explicitly set
+  const supplierId =
+    order.supplier_id ||
+    normalizedItems[0]?.supplier_id ||
+    'pluspower';
+  const supplierName =
+    order.supplier_name ||
+    normalizedItems[0]?.supplier_name ||
+    (supplierId === 'pluspower' ? 'PlusPower Supplements' : 'Fornitore');
+
+  // Build full scoped order
   const scopedOrder: Order = {
+    ...existingOrder,
     ...order,
-    created_at: order.created_at || new Date().toISOString(),
+    id: orderId,
+    workspace_id: workspaceId,
+    order_number:
+      order.order_number ||
+      existingOrder?.order_number ||
+      `ORD-${new Date().getFullYear()}-${Math.floor(1000 + Math.random() * 9000)}`,
+    external_order_id: externalId || null,
+    ebay_order_id: order.ebay_order_id ?? existingOrder?.ebay_order_id ?? null,
+    order_source: order.order_source || existingOrder?.order_source || 'manual',
+    buyer_username: order.buyer_username ?? existingOrder?.buyer_username ?? '',
+    buyer_name: order.buyer_name ?? existingOrder?.buyer_name ?? '',
+    buyer_email: order.buyer_email ?? existingOrder?.buyer_email ?? '',
+    buyer_phone: order.buyer_phone ?? existingOrder?.buyer_phone ?? '',
+    shipping_address: order.shipping_address ?? existingOrder?.shipping_address ?? {},
+    status: (order.status || existingOrder?.status || 'pending') as OrderStatus,
+    supplier_purchasing_status:
+      order.supplier_purchasing_status ?? existingOrder?.supplier_purchasing_status ?? 'not_purchased',
+    delivery_status:
+      order.delivery_status ?? existingOrder?.delivery_status ?? 'unfulfilled',
+    items: normalizedItems,
+    currency: order.currency || existingOrder?.currency || 'EUR',
+    total_paid: financials.totalRevenue,
+    shipping_charged_to_buyer: financials.shippingChargedToBuyer,
+    supplier_shipping_cost: financials.supplierShippingCost,
+    packaging_cost: financials.packagingCost,
+    estimated_ebay_fees: financials.estimatedEbayFees,
+    total_cost: financials.totalCost,
+    net_profit: financials.netProfit,
+    profit_margin: financials.profitMargin,
+    supplier_id: supplierId,
+    supplier_name: supplierName,
+    supplier_order_reference: order.supplier_order_reference ?? existingOrder?.supplier_order_reference ?? null,
+    supplier_purchased_at: order.supplier_purchased_at ?? existingOrder?.supplier_purchased_at ?? null,
+    supplier_notes: order.supplier_notes ?? existingOrder?.supplier_notes ?? null,
+    carrier: order.carrier ?? existingOrder?.carrier ?? null,
+    tracking_number: order.tracking_number ?? existingOrder?.tracking_number ?? null,
+    tracking_url: order.tracking_url ?? existingOrder?.tracking_url ?? null,
+    dispatched_at: order.dispatched_at ?? existingOrder?.dispatched_at ?? null,
+    delivered_at: order.delivered_at ?? existingOrder?.delivered_at ?? null,
+    cancellation_reason: order.cancellation_reason ?? existingOrder?.cancellation_reason ?? null,
+    cancelled_at: order.cancelled_at ?? existingOrder?.cancelled_at ?? null,
+    return_status: order.return_status ?? existingOrder?.return_status ?? 'none',
+    return_reason: order.return_reason ?? existingOrder?.return_reason ?? null,
+    returned_at: order.returned_at ?? existingOrder?.returned_at ?? null,
+    refund_amount: financials.totalRefunds,
+    refund_reason: order.refund_reason ?? existingOrder?.refund_reason ?? null,
+    refunded_at: order.refunded_at ?? existingOrder?.refunded_at ?? null,
+    refunds: order.refunds ?? existingOrder?.refunds ?? [],
+    events,
+    notes: order.notes ?? existingOrder?.notes ?? null,
+    created_at: createdAt,
+    updated_at: now,
   };
 
+  // 1. Supabase persistence
   const config = getWorkspaceConfig();
   if (config.supabaseUrl && config.serviceRoleKey) {
     try {
@@ -1277,14 +1581,16 @@ export async function saveWorkspaceOrder(
           workspace_id: workspaceId,
         };
         const { error } = await client.from('orders').upsert(payload, { onConflict: 'id' });
-        if (error) return { ok: false, order: scopedOrder, error: error.message };
-        return { ok: true, order: scopedOrder };
+        if (error) {
+          console.warn('Supabase order upsert warning:', error.message);
+        }
       }
-    } catch {
-      // Fallback
+    } catch (err: any) {
+      console.warn('Supabase order upsert exception:', err.message);
     }
   }
 
+  // 2. In-memory store persistence
   const list = workspaceOrdersStore.get(workspaceId) || [];
   const existingIdx = list.findIndex((o) => o.id === scopedOrder.id);
   if (existingIdx >= 0) {
@@ -1293,7 +1599,439 @@ export async function saveWorkspaceOrder(
     list.unshift(scopedOrder);
   }
   workspaceOrdersStore.set(workspaceId, list);
+
   return { ok: true, order: scopedOrder };
+}
+
+export async function createWorkspaceOrder(
+  workspaceId: string,
+  orderData: Partial<Order>,
+  actor?: string
+): Promise<{ ok: boolean; order?: Order; error?: string }> {
+  return saveWorkspaceOrder(workspaceId, orderData, actor);
+}
+
+export async function cancelWorkspaceOrder(
+  workspaceId: string,
+  orderId: string,
+  reason: string,
+  actor?: string
+): Promise<{ ok: boolean; order?: Order; error?: string }> {
+  if (!reason || !reason.trim()) {
+    return { ok: false, error: 'A cancellation reason is required.' };
+  }
+
+  const order = await getWorkspaceOrder(workspaceId, orderId);
+  if (!order) {
+    return { ok: false, error: 'Order not found in this workspace' };
+  }
+
+  const now = new Date().toISOString();
+  const events = order.events ? [...order.events] : [];
+  events.unshift({
+    id: crypto.randomUUID ? crypto.randomUUID() : `evt-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+    order_id: orderId,
+    timestamp: now,
+    actor: actor || 'system',
+    event_type: 'cancelled',
+    description: `Ordine annullato: ${reason || 'Richiesta utente'}`,
+    data: { reason },
+  });
+
+  const updated: Order = {
+    ...order,
+    status: 'cancelled',
+    cancellation_reason: reason || 'Annullato manualmente',
+    cancelled_at: now,
+    events,
+    updated_at: now,
+  };
+
+  return saveWorkspaceOrder(workspaceId, updated, actor);
+}
+
+export async function updateOrderFulfillment(
+  workspaceId: string,
+  orderId: string,
+  fulfillment: {
+    carrier?: string;
+    tracking_number?: string;
+    tracking_url?: string;
+    dispatched_at?: string;
+    delivered_at?: string;
+    delivery_status?: DeliveryStatus;
+  },
+  actor?: string
+): Promise<{ ok: boolean; order?: Order; error?: string }> {
+  const order = await getWorkspaceOrder(workspaceId, orderId);
+  if (!order) {
+    return { ok: false, error: 'Order not found in this workspace' };
+  }
+
+  const now = new Date().toISOString();
+  const events = order.events ? [...order.events] : [];
+
+  let newDeliveryStatus: DeliveryStatus =
+    fulfillment.delivery_status ||
+    (fulfillment.tracking_number ? 'in_transit' : order.delivery_status || 'unfulfilled');
+
+  let newOrderStatus: OrderStatus = order.status;
+  if (fulfillment.delivery_status === 'delivered') {
+    newOrderStatus = 'delivered';
+  } else if (fulfillment.tracking_number || newDeliveryStatus === 'in_transit') {
+    if (order.status !== 'delivered' && order.status !== 'cancelled' && order.status !== 'returned') {
+      newOrderStatus = 'shipped';
+    }
+  }
+
+  events.unshift({
+    id: crypto.randomUUID ? crypto.randomUUID() : `evt-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+    order_id: orderId,
+    timestamp: now,
+    actor: actor || 'system',
+    event_type: fulfillment.delivery_status === 'delivered' ? 'delivered' : 'fulfillment_updated',
+    description: `Spedizione aggiornata: Corriere ${fulfillment.carrier || order.carrier || '-'}, Tracking: ${fulfillment.tracking_number || order.tracking_number || '-'}`,
+    data: fulfillment,
+  });
+
+  const updated: Order = {
+    ...order,
+    carrier: fulfillment.carrier !== undefined ? fulfillment.carrier : order.carrier,
+    tracking_number: fulfillment.tracking_number !== undefined ? fulfillment.tracking_number : order.tracking_number,
+    tracking_url: fulfillment.tracking_url !== undefined ? fulfillment.tracking_url : order.tracking_url,
+    dispatched_at: fulfillment.dispatched_at || order.dispatched_at || (fulfillment.tracking_number ? now : null),
+    delivered_at: fulfillment.delivered_at || (fulfillment.delivery_status === 'delivered' ? now : order.delivered_at),
+    delivery_status: newDeliveryStatus,
+    status: newOrderStatus,
+    events,
+    updated_at: now,
+  };
+
+  return saveWorkspaceOrder(workspaceId, updated, actor);
+}
+
+export async function updateOrderSupplierPurchase(
+  workspaceId: string,
+  orderId: string,
+  supplierData: {
+    supplier_id?: string;
+    supplier_name?: string;
+    supplier_order_reference?: string;
+    supplier_purchased_at?: string;
+    supplier_notes?: string;
+    supplier_purchasing_status?: SupplierPurchasingStatus;
+    supplier_shipping_cost?: number;
+    supplier_cost?: number;
+  },
+  actor?: string
+): Promise<{ ok: boolean; order?: Order; error?: string }> {
+  const order = await getWorkspaceOrder(workspaceId, orderId);
+  if (!order) {
+    return { ok: false, error: 'Order not found in this workspace' };
+  }
+
+  const now = new Date().toISOString();
+  const events = order.events ? [...order.events] : [];
+
+  const purchasingStatus = supplierData.supplier_purchasing_status || 'ordered';
+  let newOrderStatus: OrderStatus = order.status;
+  if ((purchasingStatus === 'ordered' || purchasingStatus === 'confirmed') && (order.status === 'pending' || order.status === 'awaiting_purchase')) {
+    newOrderStatus = 'purchased';
+  }
+
+  events.unshift({
+    id: crypto.randomUUID ? crypto.randomUUID() : `evt-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+    order_id: orderId,
+    timestamp: now,
+    actor: actor || 'system',
+    event_type: 'supplier_updated',
+    description: `Acquisto fornitore aggiornato: ${supplierData.supplier_name || order.supplier_name || 'Fornitore'} (Rif: ${supplierData.supplier_order_reference || '-'}, Stato: ${purchasingStatus})`,
+    data: supplierData,
+  });
+
+  const updated: Order = {
+    ...order,
+    supplier_id: supplierData.supplier_id || order.supplier_id,
+    supplier_name: supplierData.supplier_name || order.supplier_name,
+    supplier_order_reference: supplierData.supplier_order_reference !== undefined ? supplierData.supplier_order_reference : order.supplier_order_reference,
+    supplier_purchased_at: supplierData.supplier_purchased_at || now,
+    supplier_notes: supplierData.supplier_notes !== undefined ? supplierData.supplier_notes : order.supplier_notes,
+    supplier_purchasing_status: purchasingStatus,
+    supplier_shipping_cost: supplierData.supplier_shipping_cost !== undefined ? supplierData.supplier_shipping_cost : order.supplier_shipping_cost,
+    status: newOrderStatus,
+    events,
+    updated_at: now,
+  };
+
+  return saveWorkspaceOrder(workspaceId, updated, actor);
+}
+
+export async function recordOrderReturn(
+  workspaceId: string,
+  orderId: string,
+  returnData: {
+    return_status?: ReturnStatus;
+    return_reason?: string;
+    returned_at?: string;
+    restock_items?: boolean;
+  },
+  actor?: string
+): Promise<{ ok: boolean; order?: Order; error?: string }> {
+  const order = await getWorkspaceOrder(workspaceId, orderId);
+  if (!order) {
+    return { ok: false, error: 'Order not found in this workspace' };
+  }
+
+  const now = new Date().toISOString();
+  const events = order.events ? [...order.events] : [];
+
+  const returnStatus: ReturnStatus = returnData.return_status || 'requested';
+  let newOrderStatus: OrderStatus = order.status;
+  if (returnStatus === 'completed' || returnStatus === 'item_received' || returnStatus === 'requested' || returnStatus === 'approved') {
+    newOrderStatus = 'returned';
+  }
+
+  events.unshift({
+    id: crypto.randomUUID ? crypto.randomUUID() : `evt-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+    order_id: orderId,
+    timestamp: now,
+    actor: actor || 'system',
+    event_type: returnStatus === 'requested' ? 'return_requested' : 'return_status_changed',
+    description: `Stato reso: ${returnStatus} (Motivo: ${returnData.return_reason || 'Non specificato'})`,
+    data: returnData,
+  });
+
+  const updated: Order = {
+    ...order,
+    return_status: returnStatus,
+    return_reason: returnData.return_reason || order.return_reason,
+    returned_at: returnData.returned_at || (returnStatus === 'completed' ? now : order.returned_at),
+    status: newOrderStatus,
+    events,
+    updated_at: now,
+  };
+
+  return saveWorkspaceOrder(workspaceId, updated, actor);
+}
+
+export async function recordOrderRefund(
+  workspaceId: string,
+  orderId: string,
+  refundData: {
+    amount: number;
+    reason?: string;
+    refunded_at?: string;
+  },
+  actor?: string
+): Promise<{ ok: boolean; order?: Order; error?: string }> {
+  const order = await getWorkspaceOrder(workspaceId, orderId);
+  if (!order) {
+    return { ok: false, error: 'Order not found in this workspace' };
+  }
+
+  const now = new Date().toISOString();
+  const refundAmount = Math.max(0, Number(refundData.amount) || 0);
+  const refundItem: OrderRefundItem = {
+    id: crypto.randomUUID ? crypto.randomUUID() : `ref-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+    amount: refundAmount,
+    reason: refundData.reason || 'Rimborso cliente',
+    timestamp: refundData.refunded_at || now,
+    actor: actor || 'system',
+  };
+
+  const existingRefunds = Array.isArray(order.refunds) ? [...order.refunds] : [];
+  existingRefunds.push(refundItem);
+  const totalRefundAmount = existingRefunds.reduce((acc, r) => acc + (Number(r.amount) || 0), 0);
+
+  const events = order.events ? [...order.events] : [];
+  events.unshift({
+    id: crypto.randomUUID ? crypto.randomUUID() : `evt-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+    order_id: orderId,
+    timestamp: now,
+    actor: actor || 'system',
+    event_type: 'refund_issued',
+    description: `Rimborso emesso: €${refundAmount.toFixed(2)} (Motivo: ${refundData.reason || 'Non specificato'})`,
+    data: refundItem,
+  });
+
+  const updated: Order = {
+    ...order,
+    refund_amount: totalRefundAmount,
+    refund_reason: refundData.reason || order.refund_reason,
+    refunded_at: refundData.refunded_at || now,
+    refunds: existingRefunds,
+    events,
+    updated_at: now,
+  };
+
+  return saveWorkspaceOrder(workspaceId, updated, actor);
+}
+
+export async function deleteWorkspaceOrder(
+  workspaceId: string,
+  orderId: string
+): Promise<boolean> {
+  const config = getWorkspaceConfig();
+  if (config.supabaseUrl && config.serviceRoleKey) {
+    try {
+      const client = createServiceRoleClient(config.supabaseUrl, config.serviceRoleKey);
+      if (client) {
+        const { error } = await client
+          .from('orders')
+          .delete()
+          .eq('id', orderId)
+          .eq('workspace_id', workspaceId);
+        if (!error) return true;
+      }
+    } catch {
+      // Fallback
+    }
+  }
+
+  const list = workspaceOrdersStore.get(workspaceId) || [];
+  const filtered = list.filter((o) => o.id !== orderId);
+  const deleted = filtered.length < list.length;
+  workspaceOrdersStore.set(workspaceId, filtered);
+  return deleted;
+}
+
+export async function getWorkspaceOrderSummaryStats(
+  workspaceId: string
+): Promise<OrderSummaryStats> {
+  const orders = await listWorkspaceOrders(workspaceId);
+
+  let pendingCount = 0;
+  let awaitingPurchaseCount = 0;
+  let awaitingDispatchCount = 0;
+  let shippedCount = 0;
+  let deliveredCount = 0;
+  let returnedCount = 0;
+  let cancelledCount = 0;
+
+  let totalRevenue = 0;
+  let totalSupplierCost = 0;
+  let totalProfit = 0;
+
+  for (const o of orders) {
+    totalRevenue += Number(o.total_paid) || 0;
+    totalSupplierCost += Number(o.total_cost) || 0;
+    totalProfit += Number(o.net_profit) || 0;
+
+    if (o.status === 'awaiting_purchase' || o.supplier_purchasing_status === 'not_purchased') {
+      awaitingPurchaseCount++;
+    }
+
+    switch (o.status) {
+      case 'pending':
+      case 'pending_fulfillment':
+        pendingCount++;
+        break;
+      case 'awaiting_purchase':
+        // already counted in awaitingPurchaseCount
+        break;
+      case 'purchased':
+      case 'awaiting_dispatch':
+        awaitingDispatchCount++;
+        break;
+      case 'shipped':
+        shippedCount++;
+        break;
+      case 'delivered':
+      case 'fulfilled':
+        deliveredCount++;
+        break;
+      case 'returned':
+        returnedCount++;
+        break;
+      case 'cancelled':
+        cancelledCount++;
+        break;
+      default:
+        pendingCount++;
+        break;
+    }
+  }
+
+  const roundedRevenue = Math.round(totalRevenue * 100) / 100;
+  const roundedSupplierCost = Math.round(totalSupplierCost * 100) / 100;
+  const roundedProfit = Math.round(totalProfit * 100) / 100;
+
+  return {
+    totalOrders: orders.length,
+    total_orders: orders.length,
+    pendingCount,
+    pending_orders: pendingCount,
+    awaitingPurchaseCount,
+    awaiting_supplier_purchase: awaitingPurchaseCount,
+    awaitingDispatchCount,
+    awaiting_dispatch: awaitingDispatchCount,
+    shippedCount,
+    shipped_orders: shippedCount,
+    deliveredCount,
+    delivered_orders: deliveredCount,
+    returnedCount,
+    returned_orders: returnedCount,
+    cancelledCount,
+    cancelled_orders: cancelledCount,
+    totalRevenue: roundedRevenue,
+    total_revenue: roundedRevenue,
+    totalSupplierCost: roundedSupplierCost,
+    total_supplier_cost: roundedSupplierCost,
+    totalProfit: roundedProfit,
+    total_net_profit: roundedProfit,
+  };
+}
+
+function normalizeOrderRecord(row: any): Order {
+  return {
+    id: row.id,
+    workspace_id: row.workspace_id,
+    order_number: row.order_number || `ORD-${row.id.slice(0, 8).toUpperCase()}`,
+    external_order_id: row.external_order_id || null,
+    ebay_order_id: row.ebay_order_id || null,
+    order_source: row.order_source || 'manual',
+    buyer_username: row.buyer_username || '',
+    buyer_name: row.buyer_name || '',
+    buyer_email: row.buyer_email || '',
+    buyer_phone: row.buyer_phone || '',
+    shipping_address: row.shipping_address || {},
+    status: row.status || 'pending',
+    supplier_purchasing_status: row.supplier_purchasing_status || 'not_purchased',
+    delivery_status: row.delivery_status || 'unfulfilled',
+    items: Array.isArray(row.items) ? row.items : [],
+    currency: row.currency || 'EUR',
+    total_paid: Number(row.total_paid) || 0,
+    shipping_charged_to_buyer: Number(row.shipping_charged_to_buyer) || 0,
+    supplier_shipping_cost: Number(row.supplier_shipping_cost) || 0,
+    packaging_cost: Number(row.packaging_cost) || 0,
+    estimated_ebay_fees: Number(row.estimated_ebay_fees) || 0,
+    total_cost: Number(row.total_cost) || 0,
+    net_profit: Number(row.net_profit) || 0,
+    profit_margin: Number(row.profit_margin) || 0,
+    supplier_id: row.supplier_id || 'pluspower',
+    supplier_name: row.supplier_name || 'PlusPower Supplements',
+    supplier_order_reference: row.supplier_order_reference || null,
+    supplier_purchased_at: row.supplier_purchased_at || null,
+    supplier_notes: row.supplier_notes || null,
+    carrier: row.carrier || null,
+    tracking_number: row.tracking_number || null,
+    tracking_url: row.tracking_url || null,
+    dispatched_at: row.dispatched_at || null,
+    delivered_at: row.delivered_at || null,
+    cancellation_reason: row.cancellation_reason || null,
+    cancelled_at: row.cancelled_at || null,
+    return_status: row.return_status || 'none',
+    return_reason: row.return_reason || null,
+    returned_at: row.returned_at || null,
+    refund_amount: Number(row.refund_amount) || 0,
+    refund_reason: row.refund_reason || null,
+    refunded_at: row.refunded_at || null,
+    refunds: Array.isArray(row.refunds) ? row.refunds : [],
+    events: Array.isArray(row.events) ? row.events : [],
+    notes: row.notes || null,
+    created_at: row.created_at || new Date().toISOString(),
+    updated_at: row.updated_at || row.created_at,
+  };
 }
 
 // ==============================================================================
@@ -1382,3 +2120,66 @@ export async function addWorkspaceImportHistory(workspaceId: string, item: Impor
 export async function clearWorkspaceImportHistory(workspaceId: string): Promise<void> {
   workspaceImportHistoryStore.set(workspaceId, []);
 }
+
+// ==============================================================================
+// 6. FINANCIAL ANALYTICS & PROFIT REPORTING (Phase 1.6B)
+// ==============================================================================
+
+export async function getWorkspaceFinancialReport(
+  workspaceId: string,
+  options?: {
+    range?: DateRangePreset;
+    startDate?: string;
+    endDate?: string;
+    referenceDate?: Date;
+  }
+): Promise<FinancialReport> {
+  const orders = await listWorkspaceOrders(workspaceId);
+  const report = computeFinancialReport(
+    orders,
+    options?.range || 'this_month',
+    options?.startDate,
+    options?.endDate,
+    options?.referenceDate || new Date()
+  );
+  report.workspaceId = workspaceId;
+  return report;
+}
+
+export async function exportWorkspaceFinancialOrdersCsv(
+  workspaceId: string,
+  options?: {
+    range?: DateRangePreset;
+    startDate?: string;
+    endDate?: string;
+    referenceDate?: Date;
+  }
+): Promise<{ filename: string; csv: string; count: number; dateRangeLabel: string }> {
+  const orders = await listWorkspaceOrders(workspaceId);
+  const { startDate, endDate, label } = getDateRangeBoundaries(
+    options?.range || 'this_month',
+    options?.startDate,
+    options?.endDate,
+    options?.referenceDate || new Date()
+  );
+
+  const startTime = startDate.getTime();
+  const endTime = endDate.getTime();
+
+  const filteredOrders = orders.filter((o) => {
+    const t = new Date(o.created_at).getTime();
+    return t >= startTime && t <= endTime;
+  });
+
+  const csv = generateFinancialOrdersCsv(filteredOrders);
+  const rangeSlug = (options?.range || 'this_month').toLowerCase().replace(/_/g, '-');
+  const filename = `sinchods-financial-report-${workspaceId}-${rangeSlug}-${new Date().toISOString().slice(0, 10)}.csv`;
+
+  return {
+    filename,
+    csv,
+    count: filteredOrders.length,
+    dateRangeLabel: label,
+  };
+}
+

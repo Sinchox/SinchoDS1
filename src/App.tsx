@@ -1,7 +1,8 @@
 import React, { useState, useEffect } from 'react';
-import { Product, ImportHistoryItem, EbayListing, Supplier } from './types.js';
+import { Product, ImportHistoryItem, EbayListing, Supplier, Order } from './types.js';
 import { Navbar, PageId } from './components/Navbar.js';
 import { Dashboard } from './components/Dashboard.js';
+import { Orders } from './components/Orders.js';
 import { Products } from './components/Products.js';
 import { Suppliers } from './components/Suppliers.js';
 import { Listings } from './components/Listings.js';
@@ -22,6 +23,15 @@ import {
   fetchAllEbayListings,
   saveEbayListingToDb,
   deleteEbayListingFromDb,
+  fetchAllOrders,
+  saveOrderToDb,
+  deleteOrderFromDb,
+  cancelOrderInDb,
+  updateOrderFulfillmentInDb,
+  updateOrderSupplierInDb,
+  recordOrderReturnInDb,
+  recordOrderRefundInDb,
+  saveLocalOrders,
 } from './utils/supabase.js';
 import { INITIAL_SUPPLIERS } from './utils/suppliers.js';
 import { calculateEbayPricing, generateEbayTitle, generateEbayDescriptionHtml, DEFAULT_PRICING_RULE } from './utils/pricing.js';
@@ -107,10 +117,163 @@ const INITIAL_SEED_PRODUCTS: Product[] = [
   },
 ];
 
+// Seed orders (Phase 1.6A)
+const INITIAL_SEED_ORDERS: Order[] = [
+  {
+    id: 'seed-order-1042',
+    order_number: 'ORD-2026-1042',
+    order_source: 'manual',
+    status: 'shipped',
+    delivery_status: 'in_transit',
+    supplier_purchasing_status: 'confirmed',
+    supplier_id: 'pluspower',
+    supplier_name: 'PlusPower Supplements',
+    supplier_order_reference: 'PP-2026-8812',
+    supplier_purchased_at: new Date(Date.now() - 3600000 * 24).toISOString(),
+    carrier: 'GLS',
+    tracking_number: 'ZY982341123IT',
+    dispatched_at: new Date(Date.now() - 3600000 * 12).toISOString(),
+    currency: 'EUR',
+    total_paid: 101.8,
+    shipping_charged_to_buyer: 0,
+    supplier_shipping_cost: 0,
+    packaging_cost: 0,
+    estimated_ebay_fees: 12.06,
+    total_cost: 73.4,
+    net_profit: 16.34,
+    profit_margin: 16.05,
+    buyer_name: 'Marco Bianchi',
+    buyer_username: 'marcobianchi_roma',
+    buyer_email: 'marco.bianchi@gmail.com',
+    buyer_phone: '+39 340 1234567',
+    shipping_address: {
+      name: 'Marco Bianchi',
+      address_line1: 'Via Flaminia 142',
+      city: 'Roma',
+      state_province: 'RM',
+      postal_code: '00196',
+      country: 'Italia',
+    },
+    items: [
+      {
+        id: 'item-seed-1',
+        product_id: 'seed-hydro-isolate-2kg',
+        variant_id: 'variant-seed-1',
+        title: '100% Hydro Isolate 2kg',
+        variant_name: 'Vaniglia Deliziosa',
+        sku: 'YAM-HYDRO-VAN-2KG',
+        quantity: 1,
+        purchase_cost: 54.9,
+        selling_price: 74.9,
+        supplier_id: 'pluspower',
+        supplier_name: 'PlusPower Supplements',
+      },
+      {
+        id: 'item-seed-2',
+        title: 'Creatina Creapure 500g',
+        variant_name: 'Polvere Neutra',
+        sku: 'CREA-PUR-500',
+        quantity: 1,
+        purchase_cost: 18.5,
+        selling_price: 26.9,
+        supplier_id: 'pluspower',
+        supplier_name: 'PlusPower Supplements',
+      },
+    ],
+    events: [
+      {
+        id: 'evt-seed-3',
+        order_id: 'seed-order-1042',
+        timestamp: new Date(Date.now() - 3600000 * 12).toISOString(),
+        actor: 'manager',
+        event_type: 'fulfillment_updated',
+        description: 'Spedizione affidata a GLS. Codice tracciamento: ZY982341123IT',
+      },
+      {
+        id: 'evt-seed-2',
+        order_id: 'seed-order-1042',
+        timestamp: new Date(Date.now() - 3600000 * 24).toISOString(),
+        actor: 'manager',
+        event_type: 'supplier_updated',
+        description: 'Ordine acquistato presso PlusPower Supplements (Rif: PP-2026-8812)',
+      },
+      {
+        id: 'evt-seed-1',
+        order_id: 'seed-order-1042',
+        timestamp: new Date(Date.now() - 3600000 * 36).toISOString(),
+        actor: 'manager',
+        event_type: 'created',
+        description: 'Ordine creato manualmente',
+      },
+    ],
+    created_at: new Date(Date.now() - 3600000 * 36).toISOString(),
+    updated_at: new Date(Date.now() - 3600000 * 12).toISOString(),
+  },
+  {
+    id: 'seed-order-1043',
+    order_number: 'ORD-2026-1043',
+    order_source: 'manual',
+    status: 'awaiting_purchase',
+    delivery_status: 'unfulfilled',
+    supplier_purchasing_status: 'not_purchased',
+    supplier_id: 'pluspower',
+    supplier_name: 'PlusPower Supplements',
+    currency: 'EUR',
+    total_paid: 74.9,
+    shipping_charged_to_buyer: 0,
+    supplier_shipping_cost: 0,
+    packaging_cost: 0,
+    estimated_ebay_fees: 8.96,
+    total_cost: 54.9,
+    net_profit: 11.04,
+    profit_margin: 14.74,
+    buyer_name: 'Laura Verdi',
+    buyer_username: 'laura_verdi_milano',
+    buyer_email: 'laura.verdi@outlook.it',
+    buyer_phone: '+39 328 7654321',
+    shipping_address: {
+      name: 'Laura Verdi',
+      address_line1: 'Corso Buenos Aires 45',
+      city: 'Milano',
+      state_province: 'MI',
+      postal_code: '20124',
+      country: 'Italia',
+    },
+    items: [
+      {
+        id: 'item-seed-3',
+        product_id: 'seed-hydro-isolate-2kg',
+        variant_id: 'variant-seed-2',
+        title: '100% Hydro Isolate 2kg',
+        variant_name: 'Cioccolato Belga',
+        sku: 'YAM-HYDRO-CHOC-2KG',
+        quantity: 1,
+        purchase_cost: 54.9,
+        selling_price: 74.9,
+        supplier_id: 'pluspower',
+        supplier_name: 'PlusPower Supplements',
+      },
+    ],
+    events: [
+      {
+        id: 'evt-seed-4',
+        order_id: 'seed-order-1043',
+        timestamp: new Date(Date.now() - 3600000 * 4).toISOString(),
+        actor: 'manager',
+        event_type: 'created',
+        description: 'Ordine creato manualmente',
+      },
+    ],
+    created_at: new Date(Date.now() - 3600000 * 4).toISOString(),
+    updated_at: new Date(Date.now() - 3600000 * 4).toISOString(),
+  },
+];
+
 export default function App() {
   const [currentPage, setCurrentPage] = useState<PageId>('dashboard');
   const [products, setProducts] = useState<Product[]>([]);
   const [listings, setListings] = useState<EbayListing[]>([]);
+  const [orders, setOrders] = useState<Order[]>([]);
   const [suppliers, setSuppliers] = useState<Supplier[]>(INITIAL_SUPPLIERS);
   const [history, setHistory] = useState<ImportHistoryItem[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -194,6 +357,14 @@ export default function App() {
         } catch {
           // ignore
         }
+
+        // Fetch orders (Phase 1.6A)
+        let loadedOrders = await fetchAllOrders();
+        if (loadedOrders.length === 0) {
+          saveLocalOrders(INITIAL_SEED_ORDERS);
+          loadedOrders = INITIAL_SEED_ORDERS;
+        }
+        setOrders(loadedOrders);
 
         // Fetch history
         const hist = getLocalHistory();
@@ -359,6 +530,71 @@ export default function App() {
     setHistory([]);
   };
 
+  // Order Handlers (Phase 1.6A)
+  const handleSaveOrder = async (order: Partial<Order>): Promise<{ ok: boolean; order?: Order; error?: string }> => {
+    const res = await saveOrderToDb(order);
+    if (res.ok && res.order) {
+      setOrders((prev) => {
+        const idx = prev.findIndex((o) => o.id === res.order!.id);
+        if (idx >= 0) {
+          const next = [...prev];
+          next[idx] = res.order!;
+          return next;
+        }
+        return [res.order!, ...prev];
+      });
+    }
+    return res;
+  };
+
+  const handleCancelOrder = async (id: string, reason: string): Promise<{ ok: boolean; order?: Order; error?: string }> => {
+    const res = await cancelOrderInDb(id, reason);
+    if (res.ok && res.order) {
+      setOrders((prev) => prev.map((o) => (o.id === id ? res.order! : o)));
+    }
+    return res;
+  };
+
+  const handleUpdateFulfillment = async (id: string, fulfillment: any): Promise<{ ok: boolean; order?: Order; error?: string }> => {
+    const res = await updateOrderFulfillmentInDb(id, fulfillment);
+    if (res.ok && res.order) {
+      setOrders((prev) => prev.map((o) => (o.id === id ? res.order! : o)));
+    }
+    return res;
+  };
+
+  const handleUpdateSupplierPurchase = async (id: string, supplierData: any): Promise<{ ok: boolean; order?: Order; error?: string }> => {
+    const res = await updateOrderSupplierInDb(id, supplierData);
+    if (res.ok && res.order) {
+      setOrders((prev) => prev.map((o) => (o.id === id ? res.order! : o)));
+    }
+    return res;
+  };
+
+  const handleRecordReturn = async (id: string, returnData: any): Promise<{ ok: boolean; order?: Order; error?: string }> => {
+    const res = await recordOrderReturnInDb(id, returnData);
+    if (res.ok && res.order) {
+      setOrders((prev) => prev.map((o) => (o.id === id ? res.order! : o)));
+    }
+    return res;
+  };
+
+  const handleRecordRefund = async (id: string, refundData: any): Promise<{ ok: boolean; order?: Order; error?: string }> => {
+    const res = await recordOrderRefundInDb(id, refundData);
+    if (res.ok && res.order) {
+      setOrders((prev) => prev.map((o) => (o.id === id ? res.order! : o)));
+    }
+    return res;
+  };
+
+  const handleDeleteOrder = async (id: string): Promise<boolean> => {
+    const ok = await deleteOrderFromDb(id);
+    if (ok) {
+      setOrders((prev) => prev.filter((o) => o.id !== id));
+    }
+    return ok;
+  };
+
   const handleRestoreProducts = async (newProducts: Product[]) => {
     saveLocalProducts(newProducts);
     setProducts(newProducts);
@@ -375,6 +611,7 @@ export default function App() {
         setCurrentPage={setCurrentPage}
         productsCount={products.length}
         listingsCount={listings.length}
+        ordersCount={orders.filter((o) => o.status === 'pending' || o.status === 'awaiting_purchase').length}
         isSupabaseConnected={isSupabaseConnected}
         isEbayConnected={isEbayConnected}
       />
@@ -385,10 +622,26 @@ export default function App() {
           <Dashboard
             products={products}
             listings={listings}
+            orders={orders}
             suppliers={suppliers}
             history={history}
             setCurrentPage={setCurrentPage}
             isLoading={isLoading}
+          />
+        )}
+
+        {currentPage === 'orders' && (
+          <Orders
+            orders={orders}
+            suppliers={suppliers}
+            products={products}
+            onSaveOrder={handleSaveOrder}
+            onCancelOrder={handleCancelOrder}
+            onUpdateFulfillment={handleUpdateFulfillment}
+            onUpdateSupplierPurchase={handleUpdateSupplierPurchase}
+            onRecordReturn={handleRecordReturn}
+            onRecordRefund={handleRecordRefund}
+            onDeleteOrder={handleDeleteOrder}
           />
         )}
 

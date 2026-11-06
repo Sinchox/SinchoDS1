@@ -5,15 +5,21 @@ import {
   ImportHistoryItem,
   ScraperSettings,
   EbayListing,
-  PriceHistoryItem,
+  Order,
+  OrderSummaryStats,
+  FinancialReport,
+  DateRangePreset,
 } from '../types.js';
-import { DEFAULT_PRICING_RULE } from './pricing.js';
+import { DEFAULT_PRICING_RULE, calculateOrderFinancials } from './pricing.js';
+import { computeFinancialReport } from './financials.js';
+import { generateFinancialOrdersCsv } from './csv.js';
 
 const SETTINGS_KEY = 'sinchods_scraper_settings';
 const LOCAL_PRODUCTS_KEY = 'sinchods_local_products';
 const LOCAL_HISTORY_KEY = 'sinchods_local_history';
 const LOCAL_LISTINGS_KEY = 'sinchods_local_listings';
 const LOCAL_PRICE_HISTORY_KEY = 'sinchods_price_history';
+const LOCAL_ORDERS_KEY = 'sinchods_local_orders';
 
 export const DEFAULT_SETTINGS: ScraperSettings = {
   supabaseUrl: (import.meta as any).env?.VITE_SUPABASE_URL || '',
@@ -568,3 +574,412 @@ export function fetchPriceHistory(productId?: string): PriceHistoryItem[] {
   }
   return [];
 }
+
+// ==============================================================================
+// Orders & Fulfillment Persistence (Phase 1.6A)
+// ==============================================================================
+
+export function getLocalOrders(): Order[] {
+  try {
+    const raw = localStorage.getItem(LOCAL_ORDERS_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch (err) {
+    console.warn('Error reading local orders:', err);
+  }
+  return [];
+}
+
+export function saveLocalOrders(orders: Order[]): void {
+  try {
+    localStorage.setItem(LOCAL_ORDERS_KEY, JSON.stringify(orders));
+  } catch (err) {
+    console.error('Error saving local orders:', err);
+  }
+}
+
+export async function fetchAllOrders(filters?: {
+  status?: string;
+  supplierId?: string;
+  deliveryStatus?: string;
+  search?: string;
+}): Promise<Order[]> {
+  // First try backend API endpoint
+  try {
+    const params = new URLSearchParams();
+    if (filters?.status && filters.status !== 'all') params.append('status', filters.status);
+    if (filters?.supplierId && filters.supplierId !== 'all') params.append('supplierId', filters.supplierId);
+    if (filters?.deliveryStatus && filters.deliveryStatus !== 'all') params.append('deliveryStatus', filters.deliveryStatus);
+    if (filters?.search) params.append('search', filters.search);
+
+    const url = `/api/orders${params.toString() ? `?${params.toString()}` : ''}`;
+    const res = await fetch(url);
+    if (res.ok) {
+      const data = await res.json();
+      if (data.ok && Array.isArray(data.orders)) {
+        saveLocalOrders(data.orders);
+        return data.orders;
+      }
+    }
+  } catch {
+    // Fallback to direct client
+  }
+
+  const client = getSupabaseClient();
+  if (client) {
+    try {
+      let query = client.from('orders').select('*').order('created_at', { ascending: false });
+      if (filters?.status && filters.status !== 'all') {
+        query = query.eq('status', filters.status);
+      }
+      if (filters?.supplierId && filters.supplierId !== 'all') {
+        query = query.eq('supplier_id', filters.supplierId);
+      }
+      if (filters?.deliveryStatus && filters.deliveryStatus !== 'all') {
+        query = query.eq('delivery_status', filters.deliveryStatus);
+      }
+      const { data, error } = await query;
+      if (!error && Array.isArray(data)) {
+        saveLocalOrders(data);
+        return data;
+      }
+    } catch {
+      // Fallback to local
+    }
+  }
+
+  let list = getLocalOrders();
+  if (filters) {
+    if (filters.status && filters.status !== 'all') {
+      list = list.filter((o) => o.status === filters.status);
+    }
+    if (filters.supplierId && filters.supplierId !== 'all') {
+      list = list.filter((o) => o.supplier_id === filters.supplierId || o.items?.some((i) => i.supplier_id === filters.supplierId));
+    }
+    if (filters.deliveryStatus && filters.deliveryStatus !== 'all') {
+      list = list.filter((o) => o.delivery_status === filters.deliveryStatus);
+    }
+  }
+  return list;
+}
+
+export async function fetchOrderSummaryStats(): Promise<OrderSummaryStats> {
+  try {
+    const res = await fetch('/api/orders/summary/stats');
+    if (res.ok) {
+      const data = await res.json();
+      if (data.ok && data.stats) {
+        return data.stats;
+      }
+    }
+  } catch {
+    // Fallback
+  }
+
+  const orders = getLocalOrders();
+  let pendingCount = 0;
+  let awaitingPurchaseCount = 0;
+  let awaitingDispatchCount = 0;
+  let shippedCount = 0;
+  let deliveredCount = 0;
+  let returnedCount = 0;
+  let cancelledCount = 0;
+  let totalRevenue = 0;
+  let totalSupplierCost = 0;
+  let totalProfit = 0;
+
+  for (const o of orders) {
+    totalRevenue += Number(o.total_paid) || 0;
+    totalSupplierCost += Number(o.total_cost) || 0;
+    totalProfit += Number(o.net_profit) || 0;
+
+    switch (o.status) {
+      case 'pending':
+      case 'pending_fulfillment':
+        pendingCount++;
+        break;
+      case 'awaiting_purchase':
+        awaitingPurchaseCount++;
+        break;
+      case 'purchased':
+        awaitingDispatchCount++;
+        break;
+      case 'shipped':
+        shippedCount++;
+        break;
+      case 'delivered':
+      case 'fulfilled':
+        deliveredCount++;
+        break;
+      case 'returned':
+        returnedCount++;
+        break;
+      case 'cancelled':
+        cancelledCount++;
+        break;
+      default:
+        pendingCount++;
+        break;
+    }
+  }
+
+  return {
+    totalOrders: orders.length,
+    pendingCount,
+    awaitingPurchaseCount,
+    awaitingDispatchCount,
+    shippedCount,
+    deliveredCount,
+    returnedCount,
+    cancelledCount,
+    totalRevenue: Math.round(totalRevenue * 100) / 100,
+    totalSupplierCost: Math.round(totalSupplierCost * 100) / 100,
+    totalProfit: Math.round(totalProfit * 100) / 100,
+  };
+}
+
+export async function saveOrderToDb(
+  order: Partial<Order>
+): Promise<{ ok: boolean; order?: Order; error?: string }> {
+  try {
+    const method = order.id ? 'PUT' : 'POST';
+    const endpoint = order.id ? `/api/orders/${order.id}` : '/api/orders';
+
+    const res = await fetch(endpoint, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ order }),
+    });
+
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      return { ok: false, error: data.error || 'Failed to save order' };
+    }
+
+    // Update local cache
+    const saved = data.order as Order;
+    const local = getLocalOrders();
+    const idx = local.findIndex((o) => o.id === saved.id);
+    if (idx >= 0) {
+      local[idx] = saved;
+    } else {
+      local.unshift(saved);
+    }
+    saveLocalOrders(local);
+
+    return { ok: true, order: saved };
+  } catch (err: any) {
+    return { ok: false, error: err.message || 'Error saving order' };
+  }
+}
+
+export async function deleteOrderFromDb(id: string): Promise<boolean> {
+  try {
+    const res = await fetch(`/api/orders/${id}`, { method: 'DELETE' });
+    if (res.ok) {
+      const local = getLocalOrders().filter((o) => o.id !== id);
+      saveLocalOrders(local);
+      return true;
+    }
+  } catch {
+    // Fallback
+  }
+  const local = getLocalOrders().filter((o) => o.id !== id);
+  saveLocalOrders(local);
+  return true;
+}
+
+export async function cancelOrderInDb(
+  id: string,
+  reason: string
+): Promise<{ ok: boolean; order?: Order; error?: string }> {
+  try {
+    const res = await fetch(`/api/orders/${id}/cancel`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reason }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      return { ok: false, error: data.error || 'Failed to cancel order' };
+    }
+    const saved = data.order as Order;
+    const local = getLocalOrders();
+    const idx = local.findIndex((o) => o.id === saved.id);
+    if (idx >= 0) {
+      local[idx] = saved;
+      saveLocalOrders(local);
+    }
+    return { ok: true, order: saved };
+  } catch (err: any) {
+    return { ok: false, error: err.message || 'Error cancelling order' };
+  }
+}
+
+export async function updateOrderFulfillmentInDb(
+  id: string,
+  fulfillment: any
+): Promise<{ ok: boolean; order?: Order; error?: string }> {
+  try {
+    const res = await fetch(`/api/orders/${id}/fulfillment`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fulfillment }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      return { ok: false, error: data.error || 'Failed to update fulfillment' };
+    }
+    const saved = data.order as Order;
+    const local = getLocalOrders();
+    const idx = local.findIndex((o) => o.id === saved.id);
+    if (idx >= 0) {
+      local[idx] = saved;
+      saveLocalOrders(local);
+    }
+    return { ok: true, order: saved };
+  } catch (err: any) {
+    return { ok: false, error: err.message || 'Error updating fulfillment' };
+  }
+}
+
+export async function updateOrderSupplierInDb(
+  id: string,
+  supplierData: any
+): Promise<{ ok: boolean; order?: Order; error?: string }> {
+  try {
+    const res = await fetch(`/api/orders/${id}/supplier-purchase`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ supplierData }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      return { ok: false, error: data.error || 'Failed to update supplier purchase' };
+    }
+    const saved = data.order as Order;
+    const local = getLocalOrders();
+    const idx = local.findIndex((o) => o.id === saved.id);
+    if (idx >= 0) {
+      local[idx] = saved;
+      saveLocalOrders(local);
+    }
+    return { ok: true, order: saved };
+  } catch (err: any) {
+    return { ok: false, error: err.message || 'Error updating supplier purchase' };
+  }
+}
+
+export async function recordOrderReturnInDb(
+  id: string,
+  returnData: any
+): Promise<{ ok: boolean; order?: Order; error?: string }> {
+  try {
+    const res = await fetch(`/api/orders/${id}/return`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ returnData }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      return { ok: false, error: data.error || 'Failed to record return' };
+    }
+    const saved = data.order as Order;
+    const local = getLocalOrders();
+    const idx = local.findIndex((o) => o.id === saved.id);
+    if (idx >= 0) {
+      local[idx] = saved;
+      saveLocalOrders(local);
+    }
+    return { ok: true, order: saved };
+  } catch (err: any) {
+    return { ok: false, error: err.message || 'Error recording return' };
+  }
+}
+
+export async function recordOrderRefundInDb(
+  id: string,
+  refundData: any
+): Promise<{ ok: boolean; order?: Order; error?: string }> {
+  try {
+    const res = await fetch(`/api/orders/${id}/refund`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refundData }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      return { ok: false, error: data.error || 'Failed to record refund' };
+    }
+    const saved = data.order as Order;
+    const local = getLocalOrders();
+    const idx = local.findIndex((o) => o.id === saved.id);
+    if (idx >= 0) {
+      local[idx] = saved;
+      saveLocalOrders(local);
+    }
+    return { ok: true, order: saved };
+  } catch (err: any) {
+    return { ok: false, error: err.message || 'Error recording refund' };
+  }
+}
+
+export async function fetchFinancialReport(options?: {
+  range?: DateRangePreset;
+  startDate?: string;
+  endDate?: string;
+}): Promise<FinancialReport> {
+  try {
+    const params = new URLSearchParams();
+    if (options?.range) params.append('range', options.range);
+    if (options?.startDate) params.append('startDate', options.startDate);
+    if (options?.endDate) params.append('endDate', options.endDate);
+
+    const res = await fetch(`/api/financials/report?${params.toString()}`);
+    if (res.ok) {
+      const data = await res.json();
+      if (data.ok && data.report) {
+        return data.report;
+      }
+    }
+  } catch {
+    // fallback
+  }
+
+  const orders = getLocalOrders();
+  return computeFinancialReport(orders, options?.range || 'this_month', options?.startDate, options?.endDate);
+}
+
+export async function exportFinancialCsv(options?: {
+  range?: DateRangePreset;
+  startDate?: string;
+  endDate?: string;
+}): Promise<{ filename: string; csv: string }> {
+  try {
+    const params = new URLSearchParams();
+    if (options?.range) params.append('range', options.range);
+    if (options?.startDate) params.append('startDate', options.startDate);
+    if (options?.endDate) params.append('endDate', options.endDate);
+
+    const res = await fetch(`/api/financials/export-csv?${params.toString()}`);
+    if (res.ok) {
+      const csv = await res.text();
+      const contentDisposition = res.headers.get('Content-Disposition');
+      let filename = `sinchods-financial-report-${options?.range || 'this_month'}-${new Date().toISOString().slice(0, 10)}.csv`;
+      if (contentDisposition && contentDisposition.includes('filename=')) {
+        const match = contentDisposition.match(/filename="?([^"]+)"?/);
+        if (match && match[1]) filename = match[1];
+      }
+      return { filename, csv };
+    }
+  } catch {
+    // fallback
+  }
+
+  const orders = getLocalOrders();
+  const csv = generateFinancialOrdersCsv(orders);
+  return {
+    filename: `sinchods-financial-report-${options?.range || 'this_month'}-${new Date().toISOString().slice(0, 10)}.csv`,
+    csv,
+  };
+}
+

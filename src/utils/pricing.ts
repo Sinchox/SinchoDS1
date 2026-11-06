@@ -6,6 +6,8 @@ import {
   EbayListing,
   ListingValidationResult,
   ListingValidationCheck,
+  OrderLineItem,
+  OrderFinancials,
 } from '../types.js';
 
 export const DEFAULT_PRICING_RULE: PricingRule = {
@@ -608,4 +610,120 @@ function escapeHtml(str: string): string {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#039;');
+}
+
+/**
+ * Calculates order-level revenue, supplier costs, shipping costs, estimated eBay fees, refunds, and net profit.
+ */
+export function calculateOrderFinancials(
+  itemsOrOptions: OrderLineItem[] | {
+    items?: OrderLineItem[];
+    shippingChargedToBuyer?: number;
+    shipping_charged_to_buyer?: number;
+    supplierShippingCost?: number;
+    supplier_shipping_cost?: number;
+    packagingCost?: number;
+    packaging_cost?: number;
+    refundAmount?: number;
+    refunds_amount?: number;
+    refunds?: { amount: number; reason?: string; timestamp?: string }[];
+    ebayFeePercent?: number;
+    ebayFixedFee?: number;
+  },
+  options?: {
+    shippingChargedToBuyer?: number;
+    shipping_charged_to_buyer?: number;
+    supplierShippingCost?: number;
+    supplier_shipping_cost?: number;
+    packagingCost?: number;
+    packaging_cost?: number;
+    refundAmount?: number;
+    refunds_amount?: number;
+    refunds?: { amount: number; reason?: string; timestamp?: string }[];
+    ebayFeePercent?: number;
+    ebayFixedFee?: number;
+  }
+): OrderFinancials {
+  let lineItems: OrderLineItem[] = [];
+  let opts: any = {};
+
+  if (Array.isArray(itemsOrOptions)) {
+    lineItems = itemsOrOptions;
+    opts = options || {};
+  } else if (itemsOrOptions && typeof itemsOrOptions === 'object') {
+    lineItems = Array.isArray(itemsOrOptions.items) ? itemsOrOptions.items : [];
+    opts = itemsOrOptions;
+  }
+
+  const shippingChargedToBuyer = Math.max(0, Number(opts.shippingChargedToBuyer ?? opts.shipping_charged_to_buyer) || 0);
+  const supplierShippingCost = Math.max(0, Number(opts.supplierShippingCost ?? opts.supplier_shipping_cost) || 0);
+  const packagingCost = Math.max(0, Number(opts.packagingCost ?? opts.packaging_cost) || 0);
+
+  let totalRefunds = Math.max(0, Number(opts.refundAmount ?? opts.refunds_amount) || 0);
+  if (Array.isArray(opts.refunds)) {
+    totalRefunds = opts.refunds.reduce((sum: number, r: any) => sum + (Number(r?.amount) || 0), 0);
+  }
+
+  const ebayFeePercent = opts.ebayFeePercent ?? DEFAULT_PRICING_RULE.ebayFeePercent;
+  const ebayFixedFee = opts.ebayFixedFee ?? DEFAULT_PRICING_RULE.ebayFixedFee;
+
+  let itemsTotalSelling = 0;
+  let itemsTotalCost = 0;
+
+  for (const item of lineItems) {
+    const qty = Math.max(1, Number(item.quantity) || 1);
+    const sellPrice = Number(item.selling_price ?? item.sale_price) || 0;
+    const costPrice = Number(item.purchase_cost ?? item.supplier_cost) || 0;
+    itemsTotalSelling += sellPrice * qty;
+    itemsTotalCost += costPrice * qty;
+  }
+
+  const totalRevenue = itemsTotalSelling + shippingChargedToBuyer;
+  const totalCost = itemsTotalCost + supplierShippingCost + packagingCost;
+
+  // Estimated eBay fee on total charged to buyer
+  const estimatedEbayFees = totalRevenue > 0
+    ? Math.round(((totalRevenue * (ebayFeePercent / 100)) + ebayFixedFee) * 100) / 100
+    : 0;
+
+  const netProfit = Math.round((totalRevenue - totalCost - estimatedEbayFees - totalRefunds) * 100) / 100;
+  const profitMargin = totalRevenue > 0
+    ? Math.round((netProfit / totalRevenue) * 10000) / 100
+    : 0;
+
+  const itemsTotalSellingRound = Math.round(itemsTotalSelling * 100) / 100;
+  const shippingChargedRound = Math.round(shippingChargedToBuyer * 100) / 100;
+  const totalRevenueRound = Math.round(totalRevenue * 100) / 100;
+  const itemsTotalCostRound = Math.round(itemsTotalCost * 100) / 100;
+  const supplierShippingRound = Math.round(supplierShippingCost * 100) / 100;
+  const packagingCostRound = Math.round(packagingCost * 100) / 100;
+  const totalCostRound = Math.round(totalCost * 100) / 100;
+  const totalRefundsRound = Math.round(totalRefunds * 100) / 100;
+
+  return {
+    itemsTotalSelling: itemsTotalSellingRound,
+    items_total_selling: itemsTotalSellingRound,
+    shippingChargedToBuyer: shippingChargedRound,
+    shipping_charged_to_buyer: shippingChargedRound,
+    totalRevenue: totalRevenueRound,
+    total_revenue: totalRevenueRound,
+    itemsTotalCost: itemsTotalCostRound,
+    items_total_cost: itemsTotalCostRound,
+    total_supplier_cost: itemsTotalCostRound,
+    supplierShippingCost: supplierShippingRound,
+    supplier_shipping_cost: supplierShippingRound,
+    packagingCost: packagingCostRound,
+    packaging_cost: packagingCostRound,
+    totalCost: totalCostRound,
+    total_cost: totalCostRound,
+    estimatedEbayFees,
+    estimated_ebay_fees: estimatedEbayFees,
+    totalRefunds: totalRefundsRound,
+    refunds_amount: totalRefundsRound,
+    total_refunds: totalRefundsRound,
+    netProfit,
+    net_profit: netProfit,
+    profitMargin,
+    profit_margin: profitMargin,
+  };
 }

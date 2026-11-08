@@ -53,6 +53,9 @@ import {
   listWorkspaceImportHistory,
   addWorkspaceImportHistory,
   clearWorkspaceImportHistory,
+  getWorkspaceInventorySummary,
+  listWorkspaceInventoryMovements,
+  adjustWorkspaceStockManual,
 } from './workspaceStore.js';
 import {
   checkProductNow,
@@ -1135,6 +1138,89 @@ workspaceRouter.get(
       res.status(200).send(result.csv);
     } catch (err: any) {
       res.status(500).json({ ok: false, error: err.message || 'Error exporting financial CSV' });
+    }
+  }
+);
+
+// ==============================================================================
+// 5C. INVENTORY SYNCHRONIZATION & MOVEMENTS (Phase 1.7)
+// ==============================================================================
+
+/**
+ * GET /api/inventory/summary
+ * Returns aggregated stock, reserved units, low stock & out-of-stock counts.
+ */
+workspaceRouter.get(
+  '/inventory/summary',
+  requireWorkspaceContext({ minRole: 'viewer' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const summary = await getWorkspaceInventorySummary(req.workspace!.id);
+      res.json({ ok: true, summary, workspaceId: req.workspace!.id });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error fetching inventory summary' });
+    }
+  }
+);
+
+/**
+ * GET /api/inventory/movements
+ * Returns inventory movement audit trail.
+ */
+workspaceRouter.get(
+  '/inventory/movements',
+  requireWorkspaceContext({ minRole: 'viewer' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const productId = req.query.productId as string;
+      const orderId = req.query.orderId as string;
+      const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 100;
+
+      const movements = await listWorkspaceInventoryMovements(req.workspace!.id, {
+        productId,
+        orderId,
+        limit,
+      });
+
+      res.json({ ok: true, movements, workspaceId: req.workspace!.id });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error listing inventory movements' });
+    }
+  }
+);
+
+/**
+ * POST /api/inventory/adjust
+ * Manual stock adjustment with audit trail.
+ */
+workspaceRouter.post(
+  '/inventory/adjust',
+  requireWorkspaceContext({ minRole: 'manager' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const { productId, variantId, newStock, reason } = req.body;
+      if (!productId || newStock === undefined || newStock === null) {
+        res.status(400).json({ ok: false, error: 'productId and newStock are required' });
+        return;
+      }
+
+      const actor = req.user?.id || req.user?.email || 'manager';
+      const result = await adjustWorkspaceStockManual(req.workspace!.id, {
+        productId,
+        variantId,
+        newStock: Number(newStock),
+        reason,
+        actor,
+      });
+
+      if (!result.ok) {
+        res.status(400).json(result);
+        return;
+      }
+
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error adjusting stock' });
     }
   }
 );

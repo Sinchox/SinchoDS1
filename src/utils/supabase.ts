@@ -9,6 +9,9 @@ import {
   OrderSummaryStats,
   FinancialReport,
   DateRangePreset,
+  PriceHistoryItem,
+  WorkspaceInventorySummary,
+  InventoryMovement,
 } from '../types.js';
 import { DEFAULT_PRICING_RULE, calculateOrderFinancials } from './pricing.js';
 import { computeFinancialReport } from './financials.js';
@@ -982,4 +985,124 @@ export async function exportFinancialCsv(options?: {
     csv,
   };
 }
+
+// ==============================================================================
+// Inventory & Stock Synchronization (Phase 1.7)
+// ==============================================================================
+
+export async function fetchInventorySummary(): Promise<WorkspaceInventorySummary> {
+  try {
+    const res = await fetch('/api/inventory/summary');
+    if (res.ok) {
+      const data = await res.json();
+      if (data.ok && data.summary) {
+        return data.summary;
+      }
+    }
+  } catch {
+    // fallback
+  }
+
+  // Local fallback summary
+  const products = getLocalProducts();
+  let totalSkus = 0;
+  let totalOnHandStock = 0;
+  let totalReservedStock = 0;
+  let lowStockCount = 0;
+  let outOfStockCount = 0;
+  let supplierOutOfStockCount = 0;
+
+  for (const p of products) {
+    if (Array.isArray(p.variants) && p.variants.length > 0) {
+      for (const v of p.variants) {
+        totalSkus++;
+        const onHand = Number(v.stock_quantity) || 0;
+        const reserved = Number(v.reserved_stock) || 0;
+        const available = Math.max(0, onHand - reserved);
+        const threshold = Number(v.stock_threshold ?? p.stock_threshold ?? 5);
+
+        totalOnHandStock += onHand;
+        totalReservedStock += reserved;
+        if (available <= 0) outOfStockCount++;
+        else if (available <= threshold) lowStockCount++;
+
+        if (v.supplier_availability === 'OutOfStock' || (v.supplier_stock !== null && v.supplier_stock !== undefined && v.supplier_stock <= 0)) {
+          supplierOutOfStockCount++;
+        }
+      }
+    } else {
+      totalSkus++;
+      const onHand = Number(p.stock_quantity) || 0;
+      const reserved = Number(p.reserved_stock) || 0;
+      const available = Math.max(0, onHand - reserved);
+      const threshold = Number(p.stock_threshold ?? 5);
+
+      totalOnHandStock += onHand;
+      totalReservedStock += reserved;
+      if (available <= 0) outOfStockCount++;
+      else if (available <= threshold) lowStockCount++;
+
+      if (p.supplier_availability === 'OutOfStock' || (p.supplier_stock !== null && p.supplier_stock !== undefined && p.supplier_stock <= 0)) {
+        supplierOutOfStockCount++;
+      }
+    }
+  }
+
+  return {
+    totalSkus,
+    totalOnHandStock,
+    totalReservedStock,
+    totalAvailableStock: Math.max(0, totalOnHandStock - totalReservedStock),
+    lowStockCount,
+    outOfStockCount,
+    supplierOutOfStockCount,
+  };
+}
+
+export async function fetchInventoryMovements(options?: {
+  productId?: string;
+  orderId?: string;
+  limit?: number;
+}): Promise<InventoryMovement[]> {
+  try {
+    const params = new URLSearchParams();
+    if (options?.productId) params.append('productId', options.productId);
+    if (options?.orderId) params.append('orderId', options.orderId);
+    if (options?.limit) params.append('limit', String(options.limit));
+
+    const res = await fetch(`/api/inventory/movements?${params.toString()}`);
+    if (res.ok) {
+      const data = await res.json();
+      if (data.ok && Array.isArray(data.movements)) {
+        return data.movements;
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return [];
+}
+
+export async function adjustStockInDb(params: {
+  productId: string;
+  variantId?: string | null;
+  newStock: number;
+  reason?: string;
+}): Promise<{ ok: boolean; product?: Product; error?: string }> {
+  try {
+    const res = await fetch('/api/inventory/adjust', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+    });
+    const data = await res.json();
+    if (res.ok && data.ok) {
+      return { ok: true, product: data.product };
+    }
+    return { ok: false, error: data.error || 'Failed to adjust stock' };
+  } catch (err: any) {
+    return { ok: false, error: err.message || 'Error adjusting stock' };
+  }
+}
+
 

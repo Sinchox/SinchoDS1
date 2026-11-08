@@ -1,4 +1,4 @@
-import { Product, ProductVariant } from '../types.js';
+import { Product, ProductVariant, Order } from '../types.js';
 
 /**
  * Escapes a single CSV cell value according to RFC 4180.

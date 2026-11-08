@@ -3,6 +3,7 @@ import { Product, ImportHistoryItem, EbayListing, Supplier, Order } from './type
 import { Navbar, PageId } from './components/Navbar.js';
 import { Dashboard } from './components/Dashboard.js';
 import { Orders } from './components/Orders.js';
+import { Financials } from './components/Financials.js';
 import { Products } from './components/Products.js';
 import { Suppliers } from './components/Suppliers.js';
 import { Listings } from './components/Listings.js';
@@ -543,6 +544,8 @@ export default function App() {
         }
         return [res.order!, ...prev];
       });
+      // Synchronize product stock and reservation state
+      fetchAllProducts().then((p) => { if (p && p.length > 0) setProducts(p); }).catch(() => {});
     }
     return res;
   };
@@ -551,6 +554,7 @@ export default function App() {
     const res = await cancelOrderInDb(id, reason);
     if (res.ok && res.order) {
       setOrders((prev) => prev.map((o) => (o.id === id ? res.order! : o)));
+      fetchAllProducts().then((p) => { if (p && p.length > 0) setProducts(p); }).catch(() => {});
     }
     return res;
   };
@@ -559,6 +563,7 @@ export default function App() {
     const res = await updateOrderFulfillmentInDb(id, fulfillment);
     if (res.ok && res.order) {
       setOrders((prev) => prev.map((o) => (o.id === id ? res.order! : o)));
+      fetchAllProducts().then((p) => { if (p && p.length > 0) setProducts(p); }).catch(() => {});
     }
     return res;
   };
@@ -575,6 +580,7 @@ export default function App() {
     const res = await recordOrderReturnInDb(id, returnData);
     if (res.ok && res.order) {
       setOrders((prev) => prev.map((o) => (o.id === id ? res.order! : o)));
+      fetchAllProducts().then((p) => { if (p && p.length > 0) setProducts(p); }).catch(() => {});
     }
     return res;
   };
@@ -593,6 +599,17 @@ export default function App() {
       setOrders((prev) => prev.filter((o) => o.id !== id));
     }
     return ok;
+  };
+
+  const handleRefreshOrders = async () => {
+    try {
+      const loaded = await fetchAllOrders();
+      if (loaded.length > 0) {
+        setOrders(loaded);
+      }
+    } catch (err) {
+      console.error('Error refreshing orders:', err);
+    }
   };
 
   const handleRestoreProducts = async (newProducts: Product[]) => {
@@ -642,6 +659,13 @@ export default function App() {
             onRecordReturn={handleRecordReturn}
             onRecordRefund={handleRecordRefund}
             onDeleteOrder={handleDeleteOrder}
+          />
+        )}
+
+        {currentPage === 'financials' && (
+          <Financials
+            orders={orders}
+            onRefreshOrders={handleRefreshOrders}
           />
         )}
 

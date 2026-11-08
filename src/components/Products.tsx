@@ -910,10 +910,42 @@ export const Products: React.FC<ProductsProps> = ({
                       </span>
                     </div>
                     <div>
-                      <span className="text-[10px] text-slate-500 block">Stock / Variants</span>
-                      <span className="font-semibold text-slate-200">
-                        {product.variants?.length ? `${product.variants.length} variants` : `${product.stock_quantity ?? 0} in stock`}
-                      </span>
+                      <span className="text-[10px] text-slate-500 block">Scorte &amp; Disponibilità</span>
+                      {(() => {
+                        const onHand = product.variants?.length
+                          ? product.variants.reduce((acc, v) => acc + (v.stock_quantity || 0), 0)
+                          : (product.stock_quantity ?? 0);
+                        const reserved = product.variants?.length
+                          ? product.variants.reduce((acc, v) => acc + (v.reserved_stock || 0), 0)
+                          : (product.reserved_stock ?? 0);
+                        const available = Math.max(0, onHand - reserved);
+                        const threshold = product.stock_threshold ?? 5;
+                        const isOut = available === 0;
+                        const isLow = !isOut && available <= threshold;
+
+                        return (
+                          <div className="space-y-0.5">
+                            <div className="flex items-center space-x-1">
+                              {isOut ? (
+                                <span className="inline-flex items-center px-1.5 py-0.2 rounded text-[10px] font-bold bg-rose-500/20 text-rose-400 border border-rose-500/30">
+                                  Esaurito (0)
+                                </span>
+                              ) : isLow ? (
+                                <span className="inline-flex items-center px-1.5 py-0.2 rounded text-[10px] font-bold bg-amber-500/20 text-amber-400 border border-amber-500/30">
+                                  Scorta Bassa ({available})
+                                </span>
+                              ) : (
+                                <span className="inline-flex items-center px-1.5 py-0.2 rounded text-[10px] font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
+                                  Disp: {available} pz
+                                </span>
+                              )}
+                            </div>
+                            <span className="text-[10px] text-slate-400 block font-mono">
+                              Giac: {onHand} | Ris: {reserved}
+                            </span>
+                          </div>
+                        );
+                      })()}
                     </div>
                   </div>
                 </div>
@@ -1784,52 +1816,131 @@ export const Products: React.FC<ProductsProps> = ({
                 </div>
               )}
 
-              {/* SECTION 7: STOCK */}
+              {/* SECTION 7: STOCK & INVENTORY LIFECYCLE */}
               {activeTab === 'stock' && (
                 <div className="space-y-4">
-                  <div className="grid grid-cols-2 gap-3">
-                    <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl">
-                      <span className="text-[10px] text-slate-500 block">Total Catalog Stock</span>
-                      <span className="text-xl font-bold text-white">
-                        {selectedProduct.variants?.length
-                          ? selectedProduct.variants.reduce((acc, v) => acc + (v.stock_quantity || 0), 0)
-                          : selectedProduct.stock_quantity ?? 0}{' '}
-                        units
-                      </span>
-                    </div>
-                    <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl">
-                      <span className="text-[10px] text-slate-500 block">Availability Flag</span>
-                      <span
-                        className={`text-sm font-bold block mt-1 ${
-                          selectedProduct.availability === 'InStock' ? 'text-emerald-400' : 'text-rose-400'
-                        }`}
-                      >
-                        {selectedProduct.availability || 'InStock'}
-                      </span>
-                    </div>
-                  </div>
+                  {(() => {
+                    const totalOnHand = selectedProduct.variants?.length
+                      ? selectedProduct.variants.reduce((acc, v) => acc + (v.stock_quantity || 0), 0)
+                      : selectedProduct.stock_quantity ?? 0;
+                    const totalReserved = selectedProduct.variants?.length
+                      ? selectedProduct.variants.reduce((acc, v) => acc + (v.reserved_stock || 0), 0)
+                      : selectedProduct.reserved_stock ?? 0;
+                    const totalAvailable = Math.max(0, totalOnHand - totalReserved);
+                    const threshold = selectedProduct.stock_threshold ?? 5;
 
-                  {selectedProduct.variants && selectedProduct.variants.length > 0 && (
-                    <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl space-y-2">
-                      <span className="text-[10px] font-bold text-slate-400 uppercase block">
-                        Per-Variant Inventory Breakdown
-                      </span>
-                      <div className="space-y-1.5">
-                        {selectedProduct.variants.map((v) => (
-                          <div key={v.id} className="flex justify-between items-center text-xs p-1.5 bg-slate-900 rounded border border-slate-800">
-                            <span className="text-white font-medium">{v.name}</span>
+                    return (
+                      <>
+                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                          <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl">
+                            <span className="text-[10px] text-slate-500 block uppercase font-medium">Giacenza Totale</span>
+                            <span className="text-xl font-bold text-white font-mono mt-0.5 block">
+                              {totalOnHand} <span className="text-xs font-normal text-slate-400">pz</span>
+                            </span>
+                            <span className="text-[10px] text-slate-500">Unità a magazzino</span>
+                          </div>
+
+                          <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl">
+                            <span className="text-[10px] text-amber-400 block uppercase font-medium">Scorte Riservate</span>
+                            <span className="text-xl font-bold text-amber-300 font-mono mt-0.5 block">
+                              {totalReserved} <span className="text-xs font-normal text-amber-500/80">pz</span>
+                            </span>
+                            <span className="text-[10px] text-slate-500">Ordini non ancora evasi</span>
+                          </div>
+
+                          <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl">
+                            <span className="text-[10px] text-emerald-400 block uppercase font-medium">Disponibili alla Vendita</span>
                             <span
-                              className={`font-mono font-bold ${
-                                (v.stock_quantity || 0) > 0 ? 'text-emerald-400' : 'text-rose-400'
+                              className={`text-xl font-bold font-mono mt-0.5 block ${
+                                totalAvailable > 0 ? 'text-emerald-300' : 'text-rose-400'
                               }`}
                             >
-                              {v.stock_quantity ?? 0} units
+                              {totalAvailable} <span className="text-xs font-normal text-slate-400">pz</span>
+                            </span>
+                            <span className="text-[10px] text-slate-500">Giacenza meno riservati</span>
+                          </div>
+
+                          <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl">
+                            <span className="text-[10px] text-blue-400 block uppercase font-medium">Soglia Allerta Minima</span>
+                            <span className="text-xl font-bold text-blue-300 font-mono mt-0.5 block">
+                              {threshold} <span className="text-xs font-normal text-slate-400">pz</span>
+                            </span>
+                            <span className="text-[10px] text-slate-500">Notifica sottoscorta</span>
+                          </div>
+                        </div>
+
+                        {/* Supplier Status Differentiation */}
+                        <div className="p-3 bg-slate-900/80 border border-slate-800 rounded-xl flex items-center justify-between text-xs">
+                          <div>
+                            <span className="text-[10px] text-slate-400 font-medium uppercase block">Disponibilità Fornitore (Monitoraggio)</span>
+                            <span className="text-slate-200 font-medium">
+                              Stato fornitore segnalato:{' '}
+                              <strong className={selectedProduct.supplier_availability === 'OutOfStock' ? 'text-rose-400' : 'text-emerald-400'}>
+                                {selectedProduct.supplier_availability || selectedProduct.availability || 'InStock'}
+                              </strong>
+                              {selectedProduct.supplier_stock != null && (
+                                <span className="text-slate-400 ml-1">({selectedProduct.supplier_stock} pz dichiarati)</span>
+                              )}
                             </span>
                           </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
+                          <span className="text-[10px] text-slate-500 max-w-xs text-right">
+                            * Le scorte fornitore sono separate dalla giacenza locale e guidano solo gli alert di riordino.
+                          </span>
+                        </div>
+
+                        {/* Per-Variant Inventory Breakdown */}
+                        {selectedProduct.variants && selectedProduct.variants.length > 0 && (
+                          <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl space-y-2">
+                            <span className="text-[10px] font-bold text-slate-400 uppercase block">
+                              Dettaglio Scorte per Variante
+                            </span>
+                            <div className="space-y-1.5">
+                              {selectedProduct.variants.map((v) => {
+                                const vOnHand = v.stock_quantity ?? 0;
+                                const vReserved = v.reserved_stock ?? 0;
+                                const vAvail = Math.max(0, vOnHand - vReserved);
+                                const vThreshold = v.stock_threshold ?? threshold;
+                                const vIsOut = vAvail === 0;
+                                const vIsLow = !vIsOut && vAvail <= vThreshold;
+
+                                return (
+                                  <div
+                                    key={v.id}
+                                    className="flex flex-col sm:flex-row sm:items-center justify-between text-xs p-2 bg-slate-900 rounded border border-slate-800 gap-1"
+                                  >
+                                    <div className="flex items-center space-x-2">
+                                      <span className="text-white font-medium">{v.name}</span>
+                                      {v.sku && <span className="text-[10px] text-slate-500 font-mono">({v.sku})</span>}
+                                    </div>
+                                    <div className="flex items-center space-x-3 text-[11px] font-mono">
+                                      <span className="text-slate-400">Giac: <strong className="text-white">{vOnHand}</strong></span>
+                                      <span className="text-amber-400">Ris: <strong>{vReserved}</strong></span>
+                                      <span className={vAvail > 0 ? 'text-emerald-400 font-bold' : 'text-rose-400 font-bold'}>
+                                        Disp: {vAvail}
+                                      </span>
+                                      {vIsOut ? (
+                                        <span className="px-1.5 py-0.2 rounded text-[9px] font-bold bg-rose-500/20 text-rose-400 border border-rose-500/30">
+                                          Esaurito
+                                        </span>
+                                      ) : vIsLow ? (
+                                        <span className="px-1.5 py-0.2 rounded text-[9px] font-bold bg-amber-500/20 text-amber-400 border border-amber-500/30">
+                                          Sottoscorta
+                                        </span>
+                                      ) : (
+                                        <span className="px-1.5 py-0.2 rounded text-[9px] font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
+                                          OK
+                                        </span>
+                                      )}
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        )}
+                      </>
+                    );
+                  })()}
                 </div>
               )}
 

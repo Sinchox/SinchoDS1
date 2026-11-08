@@ -19,6 +19,10 @@ import {
   ImportHistoryItem,
   FinancialReport,
   DateRangePreset,
+  InventoryMovement,
+  InventoryMovementType,
+  VariantStockStatus,
+  WorkspaceInventorySummary,
 } from '../types.js';
 import { calculateOrderFinancials } from '../utils/pricing.js';
 import { computeFinancialReport, getDateRangeBoundaries } from '../utils/financials.js';
@@ -33,6 +37,10 @@ import {
 import { fetchWithZenRows, isZenRowsConfigured } from '../utils/zenrows.js';
 import { WorkspaceRole, hasMinimumRole } from './workspaceMiddleware.js';
 import { getWorkspaceConfig, createServiceRoleClient } from './workspace.js';
+import {
+  createWorkspaceNotification,
+  resolveWorkspaceNotification,
+} from './monitoringService.js';
 
 export interface EbayAccountData {
   workspaceId: string;
@@ -74,6 +82,7 @@ const workspacePriceHistoryStore = new Map<string, PriceHistoryItem[]>();
 const workspaceImportHistoryStore = new Map<string, ImportHistoryItem[]>();
 const workspaceImportJobsStore = new Map<string, ImportJob[]>();
 const workspaceInfoStore = new Map<string, WorkspaceMetadata>();
+const workspaceInventoryMovementsStore = new Map<string, InventoryMovement[]>();
 
 export function clearWorkspaceStore(): void {
   workspaceProductsStore.clear();
@@ -85,6 +94,7 @@ export function clearWorkspaceStore(): void {
   workspaceImportHistoryStore.clear();
   workspaceImportJobsStore.clear();
   workspaceInfoStore.clear();
+  workspaceInventoryMovementsStore.clear();
 }
 
 export function registerWorkspaceMetadata(meta: WorkspaceMetadata): void {
@@ -169,7 +179,7 @@ export async function saveWorkspaceProduct(
   // CRITICAL SECURITY ENFORCEMENT:
   // Overwrite any workspace_id passed in the payload with the verified workspaceId
   const scopedProduct: Product = {
-    ...product,
+    ...JSON.parse(JSON.stringify(product)),
     supplier_id: product.supplier_id || 'pluspower',
     supplier_name: product.supplier_name || (product.supplier_id === 'pluspower' ? 'PlusPower Supplements' : 'Supplier'),
     created_at: product.created_at || new Date().toISOString(),
@@ -255,7 +265,9 @@ export async function saveWorkspaceProduct(
 
   // Scoped in-memory partition update
   const list = workspaceProductsStore.get(workspaceId) || [];
-  const existingIdx = list.findIndex((p) => p.id === scopedProduct.id || p.url === scopedProduct.url);
+  const existingIdx = list.findIndex(
+    (p) => p.id === scopedProduct.id || (p.url && scopedProduct.url && p.url === scopedProduct.url)
+  );
   if (existingIdx >= 0) {
     list[existingIdx] = scopedProduct;
   } else {
@@ -1566,9 +1578,39 @@ export async function saveWorkspaceOrder(
     refunds: order.refunds ?? existingOrder?.refunds ?? [],
     events,
     notes: order.notes ?? existingOrder?.notes ?? null,
+    inventory_reserved: order.inventory_reserved ?? existingOrder?.inventory_reserved ?? false,
+    inventory_deducted: order.inventory_deducted ?? existingOrder?.inventory_deducted ?? false,
     created_at: createdAt,
     updated_at: now,
   };
+
+  // Phase 1.7: Inventory reservation & deduction lifecycle
+  const isNewOrder = !existingOrder;
+  if (isNewOrder) {
+    if (scopedOrder.status === 'shipped' || scopedOrder.status === 'delivered') {
+      await deductShippedOrderInventory(workspaceId, scopedOrder, actor);
+      scopedOrder.inventory_deducted = true;
+      scopedOrder.inventory_reserved = false;
+    } else if (scopedOrder.status !== 'cancelled') {
+      await applyOrderInventoryReservation(workspaceId, scopedOrder, actor);
+      scopedOrder.inventory_reserved = true;
+      scopedOrder.inventory_deducted = false;
+    }
+  } else {
+    // Existing order transitions
+    if (existingOrder.status !== 'cancelled' && scopedOrder.status === 'cancelled') {
+      await releaseOrderInventoryReservation(workspaceId, existingOrder, actor);
+      scopedOrder.inventory_reserved = false;
+    } else if (
+      existingOrder.status !== 'shipped' &&
+      existingOrder.status !== 'delivered' &&
+      (scopedOrder.status === 'shipped' || scopedOrder.status === 'delivered')
+    ) {
+      await deductShippedOrderInventory(workspaceId, existingOrder, actor);
+      scopedOrder.inventory_deducted = true;
+      scopedOrder.inventory_reserved = false;
+    }
+  }
 
   // 1. Supabase persistence
   const config = getWorkspaceConfig();
@@ -1638,11 +1680,15 @@ export async function cancelWorkspaceOrder(
     data: { reason },
   });
 
+  // Release reservation if not already shipped/deducted
+  await releaseOrderInventoryReservation(workspaceId, order, actor);
+
   const updated: Order = {
     ...order,
     status: 'cancelled',
     cancellation_reason: reason || 'Annullato manualmente',
     cancelled_at: now,
+    inventory_reserved: false,
     events,
     updated_at: now,
   };
@@ -1703,6 +1749,14 @@ export async function updateOrderFulfillment(
     delivered_at: fulfillment.delivered_at || (fulfillment.delivery_status === 'delivered' ? now : order.delivered_at),
     delivery_status: newDeliveryStatus,
     status: newOrderStatus,
+    inventory_deducted:
+      newOrderStatus === 'shipped' || newOrderStatus === 'delivered' || newDeliveryStatus === 'in_transit'
+        ? true
+        : order.inventory_deducted,
+    inventory_reserved:
+      newOrderStatus === 'shipped' || newOrderStatus === 'delivered' || newDeliveryStatus === 'in_transit'
+        ? false
+        : order.inventory_reserved,
     events,
     updated_at: now,
   };
@@ -1800,6 +1854,11 @@ export async function recordOrderReturn(
     description: `Stato reso: ${returnStatus} (Motivo: ${returnData.return_reason || 'Non specificato'})`,
     data: returnData,
   });
+
+  // Restock inventory if restockable
+  if (returnData.restock_items || (returnData as any).restockable) {
+    await restockReturnedOrderInventory(workspaceId, order, returnData, actor);
+  }
 
   const updated: Order = {
     ...order,
@@ -2182,4 +2241,593 @@ export async function exportWorkspaceFinancialOrdersCsv(
     dateRangeLabel: label,
   };
 }
+
+// ==============================================================================
+// 7. INVENTORY SYNCHRONIZATION & STOCK MOVEMENTS (Phase 1.7)
+// ==============================================================================
+
+export async function findProductAndVariant(
+  workspaceId: string,
+  productId?: string,
+  variantId?: string | null,
+  sku?: string
+): Promise<{ product: Product | null; variant: ProductVariant | null }> {
+  const products = await listWorkspaceProducts(workspaceId);
+
+  if (productId) {
+    const prod = products.find((p) => p.id === productId);
+    if (prod) {
+      const v = variantId ? prod.variants.find((v) => v.id === variantId) : (prod.variants[0] || null);
+      return { product: prod, variant: v || null };
+    }
+  }
+
+  if (variantId) {
+    for (const prod of products) {
+      const v = prod.variants.find((v) => v.id === variantId);
+      if (v) return { product: prod, variant: v };
+    }
+  }
+
+  if (sku) {
+    const cleanSku = sku.trim().toLowerCase();
+    for (const prod of products) {
+      const v = prod.variants.find((v) => (v.sku || '').trim().toLowerCase() === cleanSku);
+      if (v) return { product: prod, variant: v };
+      if ((prod.sku || '').trim().toLowerCase() === cleanSku) {
+        return { product: prod, variant: prod.variants[0] || null };
+      }
+    }
+  }
+
+  return { product: null, variant: null };
+}
+
+export async function recordInventoryMovement(
+  workspaceId: string,
+  movement: InventoryMovement
+): Promise<void> {
+  const config = getWorkspaceConfig();
+  if (config.supabaseUrl && config.serviceRoleKey) {
+    try {
+      const client = createServiceRoleClient(config.supabaseUrl, config.serviceRoleKey);
+      if (client) {
+        await client.from('inventory_movements').insert({
+          ...movement,
+          workspace_id: workspaceId,
+        });
+      }
+    } catch {
+      // Fallback
+    }
+  }
+
+  const list = workspaceInventoryMovementsStore.get(workspaceId) || [];
+  list.unshift(movement);
+  workspaceInventoryMovementsStore.set(workspaceId, list.slice(0, 1000));
+}
+
+export async function listWorkspaceInventoryMovements(
+  workspaceId: string,
+  options?: { productId?: string; orderId?: string; limit?: number }
+): Promise<InventoryMovement[]> {
+  const config = getWorkspaceConfig();
+  if (config.supabaseUrl && config.serviceRoleKey) {
+    try {
+      const client = createServiceRoleClient(config.supabaseUrl, config.serviceRoleKey);
+      if (client) {
+        let q = client
+          .from('inventory_movements')
+          .select('*')
+          .eq('workspace_id', workspaceId)
+          .order('created_at', { ascending: false });
+        if (options?.productId) q = q.eq('product_id', options.productId);
+        if (options?.orderId) q = q.eq('order_id', options.orderId);
+        if (options?.limit) q = q.limit(options.limit);
+        const { data, error } = await q;
+        if (!error && Array.isArray(data)) {
+          return data;
+        }
+      }
+    } catch {
+      // Fallback
+    }
+  }
+
+  let list = workspaceInventoryMovementsStore.get(workspaceId) || [];
+  if (options?.productId) {
+    list = list.filter((m) => m.product_id === options.productId);
+  }
+  if (options?.orderId) {
+    list = list.filter((m) => m.order_id === options.orderId);
+  }
+  if (options?.limit) {
+    list = list.slice(0, options.limit);
+  }
+  return [...list];
+}
+
+export async function checkAndNotifyStockThreshold(
+  workspaceId: string,
+  product: Product,
+  variant: ProductVariant | null,
+  availableStock: number,
+  threshold: number
+): Promise<void> {
+  const itemLabel = variant ? `${product.title} (${variant.name})` : product.title;
+  const dedupKey = variant ? `stock_${product.id}_${variant.id}` : `stock_${product.id}`;
+
+  if (availableStock <= 0) {
+    await createWorkspaceNotification(workspaceId, {
+      product_id: product.id,
+      supplier_id: product.supplier_id,
+      type: 'stock_depleted',
+      title: 'Scorte Esaurite (Giacenza 0)',
+      message: `Il prodotto "${itemLabel}" ha esaurito la giacenza disponibile nel magazzino locale.`,
+      severity: 'critical',
+      dedup_key: dedupKey,
+      metadata: {
+        productId: product.id,
+        variantId: variant?.id,
+        availableStock,
+        threshold,
+      },
+    });
+  } else if (availableStock <= threshold) {
+    await createWorkspaceNotification(workspaceId, {
+      product_id: product.id,
+      supplier_id: product.supplier_id,
+      type: 'stock_depleted',
+      title: 'Scorte in Esaurimento (Sotto Soglia)',
+      message: `Il prodotto "${itemLabel}" ha solo ${availableStock} pz disponibili (Soglia minima: ${threshold} pz).`,
+      severity: 'warning',
+      dedup_key: dedupKey,
+      metadata: {
+        productId: product.id,
+        variantId: variant?.id,
+        availableStock,
+        threshold,
+      },
+    });
+  } else {
+    // Stock is healthy; resolve any existing notification for this dedupKey
+    await resolveWorkspaceNotification(workspaceId, dedupKey);
+  }
+}
+
+export async function applyOrderInventoryReservation(
+  workspaceId: string,
+  order: Order,
+  actor?: string
+): Promise<{ ok: boolean; movements: InventoryMovement[]; errors?: string[] }> {
+  const movements: InventoryMovement[] = [];
+  const errors: string[] = [];
+
+  if (order.status === 'cancelled') {
+    return { ok: true, movements };
+  }
+
+  const items = Array.isArray(order.items) ? order.items : [];
+  for (const item of items) {
+    const qty = Math.max(1, Number(item.quantity) || 1);
+    const { product, variant } = await findProductAndVariant(workspaceId, item.product_id, item.variant_id, item.sku);
+
+    if (product) {
+      let stockBefore = 0;
+      let stockAfter = 0;
+      let reservedBefore = 0;
+      let reservedAfter = 0;
+
+      if (variant) {
+        stockBefore = Number(variant.stock_quantity) || 0;
+        stockAfter = stockBefore;
+        reservedBefore = Math.max(0, Number(variant.reserved_stock) || 0);
+        reservedAfter = reservedBefore + qty;
+        variant.reserved_stock = reservedAfter;
+      } else {
+        stockBefore = Number(product.stock_quantity) || 0;
+        stockAfter = stockBefore;
+        reservedBefore = Math.max(0, Number(product.reserved_stock) || 0);
+        reservedAfter = reservedBefore + qty;
+        product.reserved_stock = reservedAfter;
+      }
+
+      if (Array.isArray(product.variants) && product.variants.length > 0) {
+        product.reserved_stock = product.variants.reduce((sum, v) => sum + (Number(v.reserved_stock) || 0), 0);
+      }
+
+      await saveWorkspaceProduct(workspaceId, product);
+
+      const movement: InventoryMovement = {
+        id: crypto.randomUUID ? crypto.randomUUID() : `mov-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+        workspace_id: workspaceId,
+        product_id: product.id,
+        variant_id: variant ? variant.id : null,
+        order_id: order.id,
+        movement_type: 'reservation',
+        quantity: qty,
+        stock_before: stockBefore,
+        stock_after: stockAfter,
+        reserved_before: reservedBefore,
+        reserved_after: reservedAfter,
+        reason: `Riservato per ordine ${order.order_number || order.id}`,
+        actor: actor || 'system',
+        created_at: new Date().toISOString(),
+      };
+      await recordInventoryMovement(workspaceId, movement);
+      movements.push(movement);
+
+      const available = Math.max(0, stockAfter - reservedAfter);
+      const threshold = Number(variant?.stock_threshold ?? product.stock_threshold ?? 5);
+      await checkAndNotifyStockThreshold(workspaceId, product, variant, available, threshold);
+    }
+  }
+
+  return { ok: true, movements, errors: errors.length > 0 ? errors : undefined };
+}
+
+export async function releaseOrderInventoryReservation(
+  workspaceId: string,
+  order: Order,
+  actor?: string
+): Promise<{ ok: boolean; movements: InventoryMovement[] }> {
+  const movements: InventoryMovement[] = [];
+
+  if (!order.inventory_reserved || order.inventory_deducted) {
+    return { ok: true, movements };
+  }
+
+  const items = Array.isArray(order.items) ? order.items : [];
+  for (const item of items) {
+    const qty = Math.max(1, Number(item.quantity) || 1);
+    const { product, variant } = await findProductAndVariant(workspaceId, item.product_id, item.variant_id, item.sku);
+
+    if (product) {
+      let stockBefore = 0;
+      let stockAfter = 0;
+      let reservedBefore = 0;
+      let reservedAfter = 0;
+
+      if (variant) {
+        stockBefore = Number(variant.stock_quantity) || 0;
+        stockAfter = stockBefore;
+        reservedBefore = Math.max(0, Number(variant.reserved_stock) || 0);
+        reservedAfter = Math.max(0, reservedBefore - qty);
+        variant.reserved_stock = reservedAfter;
+      } else {
+        stockBefore = Number(product.stock_quantity) || 0;
+        stockAfter = stockBefore;
+        reservedBefore = Math.max(0, Number(product.reserved_stock) || 0);
+        reservedAfter = Math.max(0, reservedBefore - qty);
+        product.reserved_stock = reservedAfter;
+      }
+
+      if (Array.isArray(product.variants) && product.variants.length > 0) {
+        product.reserved_stock = product.variants.reduce((sum, v) => sum + (Number(v.reserved_stock) || 0), 0);
+      }
+
+      await saveWorkspaceProduct(workspaceId, product);
+
+      const movement: InventoryMovement = {
+        id: crypto.randomUUID ? crypto.randomUUID() : `mov-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+        workspace_id: workspaceId,
+        product_id: product.id,
+        variant_id: variant ? variant.id : null,
+        order_id: order.id,
+        movement_type: 'reservation_release',
+        quantity: -qty,
+        stock_before: stockBefore,
+        stock_after: stockAfter,
+        reserved_before: reservedBefore,
+        reserved_after: reservedAfter,
+        reason: `Rilascio riserva per annullamento ordine ${order.order_number || order.id}`,
+        actor: actor || 'system',
+        created_at: new Date().toISOString(),
+      };
+      await recordInventoryMovement(workspaceId, movement);
+      movements.push(movement);
+    }
+  }
+
+  return { ok: true, movements };
+}
+
+export async function deductShippedOrderInventory(
+  workspaceId: string,
+  order: Order,
+  actor?: string
+): Promise<{ ok: boolean; movements: InventoryMovement[] }> {
+  const movements: InventoryMovement[] = [];
+
+  // Idempotency: DO NOT deduct twice!
+  if (order.inventory_deducted) {
+    return { ok: true, movements };
+  }
+
+  const items = Array.isArray(order.items) ? order.items : [];
+  for (const item of items) {
+    const qty = Math.max(1, Number(item.quantity) || 1);
+    const { product, variant } = await findProductAndVariant(workspaceId, item.product_id, item.variant_id, item.sku);
+
+    if (product) {
+      let stockBefore = 0;
+      let stockAfter = 0;
+      let reservedBefore = 0;
+      let reservedAfter = 0;
+
+      if (variant) {
+        stockBefore = Number(variant.stock_quantity) || 0;
+        stockAfter = Math.max(0, stockBefore - qty);
+        reservedBefore = Math.max(0, Number(variant.reserved_stock) || 0);
+        reservedAfter = order.inventory_reserved ? Math.max(0, reservedBefore - qty) : reservedBefore;
+        variant.stock_quantity = stockAfter;
+        variant.reserved_stock = reservedAfter;
+        if (stockAfter === 0) {
+          variant.availability = 'OutOfStock';
+        }
+      } else {
+        stockBefore = Number(product.stock_quantity) || 0;
+        stockAfter = Math.max(0, stockBefore - qty);
+        reservedBefore = Math.max(0, Number(product.reserved_stock) || 0);
+        reservedAfter = order.inventory_reserved ? Math.max(0, reservedBefore - qty) : reservedBefore;
+        product.stock_quantity = stockAfter;
+        product.reserved_stock = reservedAfter;
+        if (stockAfter === 0) {
+          product.availability = 'OutOfStock';
+        }
+      }
+
+      if (Array.isArray(product.variants) && product.variants.length > 0) {
+        product.stock_quantity = product.variants.reduce((sum, v) => sum + (Number(v.stock_quantity) || 0), 0);
+        product.reserved_stock = product.variants.reduce((sum, v) => sum + (Number(v.reserved_stock) || 0), 0);
+        if (product.stock_quantity === 0) {
+          product.availability = 'OutOfStock';
+        }
+      }
+
+      await saveWorkspaceProduct(workspaceId, product);
+
+      const movement: InventoryMovement = {
+        id: crypto.randomUUID ? crypto.randomUUID() : `mov-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+        workspace_id: workspaceId,
+        product_id: product.id,
+        variant_id: variant ? variant.id : null,
+        order_id: order.id,
+        movement_type: 'deduction',
+        quantity: -qty,
+        stock_before: stockBefore,
+        stock_after: stockAfter,
+        reserved_before: reservedBefore,
+        reserved_after: reservedAfter,
+        reason: `Deduzione stock per spedizione ordine ${order.order_number || order.id}`,
+        actor: actor || 'system',
+        created_at: new Date().toISOString(),
+      };
+      await recordInventoryMovement(workspaceId, movement);
+      movements.push(movement);
+
+      const available = Math.max(0, stockAfter - reservedAfter);
+      const threshold = Number(variant?.stock_threshold ?? product.stock_threshold ?? 5);
+      await checkAndNotifyStockThreshold(workspaceId, product, variant, available, threshold);
+    }
+  }
+
+  return { ok: true, movements };
+}
+
+export async function restockReturnedOrderInventory(
+  workspaceId: string,
+  order: Order,
+  returnData: { restockable?: boolean; restock_items?: boolean; return_reason?: string },
+  actor?: string
+): Promise<{ ok: boolean; movements: InventoryMovement[] }> {
+  const movements: InventoryMovement[] = [];
+
+  const isRestockable = Boolean(returnData.restockable || returnData.restock_items);
+  if (!isRestockable) {
+    return { ok: true, movements };
+  }
+
+  if ((order as any).inventory_restocked) {
+    return { ok: true, movements };
+  }
+
+  const items = Array.isArray(order.items) ? order.items : [];
+  for (const item of items) {
+    const qty = Math.max(1, Number(item.quantity) || 1);
+    const { product, variant } = await findProductAndVariant(workspaceId, item.product_id, item.variant_id, item.sku);
+
+    if (product) {
+      let stockBefore = 0;
+      let stockAfter = 0;
+      let reservedBefore = 0;
+      let reservedAfter = 0;
+
+      if (variant) {
+        stockBefore = Number(variant.stock_quantity) || 0;
+        stockAfter = stockBefore + qty;
+        reservedBefore = Math.max(0, Number(variant.reserved_stock) || 0);
+        reservedAfter = reservedBefore;
+        variant.stock_quantity = stockAfter;
+        if (stockAfter > 0 && variant.availability === 'OutOfStock') {
+          variant.availability = 'InStock';
+        }
+      } else {
+        stockBefore = Number(product.stock_quantity) || 0;
+        stockAfter = stockBefore + qty;
+        reservedBefore = Math.max(0, Number(product.reserved_stock) || 0);
+        reservedAfter = reservedBefore;
+        product.stock_quantity = stockAfter;
+        if (stockAfter > 0 && product.availability === 'OutOfStock') {
+          product.availability = 'InStock';
+        }
+      }
+
+      if (Array.isArray(product.variants) && product.variants.length > 0) {
+        product.stock_quantity = product.variants.reduce((sum, v) => sum + (Number(v.stock_quantity) || 0), 0);
+        if (product.stock_quantity > 0 && product.availability === 'OutOfStock') {
+          product.availability = 'InStock';
+        }
+      }
+
+      await saveWorkspaceProduct(workspaceId, product);
+
+      const movement: InventoryMovement = {
+        id: crypto.randomUUID ? crypto.randomUUID() : `mov-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+        workspace_id: workspaceId,
+        product_id: product.id,
+        variant_id: variant ? variant.id : null,
+        order_id: order.id,
+        movement_type: 'return_restock',
+        quantity: qty,
+        stock_before: stockBefore,
+        stock_after: stockAfter,
+        reserved_before: reservedBefore,
+        reserved_after: reservedAfter,
+        reason: `Restock reso ordine ${order.order_number || order.id}: ${returnData.return_reason || 'Articolo integro'}`,
+        actor: actor || 'system',
+        created_at: new Date().toISOString(),
+      };
+      await recordInventoryMovement(workspaceId, movement);
+      movements.push(movement);
+    }
+  }
+
+  return { ok: true, movements };
+}
+
+export async function adjustWorkspaceStockManual(
+  workspaceId: string,
+  params: {
+    productId: string;
+    variantId?: string | null;
+    newStock: number;
+    reason?: string;
+    actor?: string;
+  }
+): Promise<{ ok: boolean; product?: Product; movement?: InventoryMovement; error?: string }> {
+  const { product, variant } = await findProductAndVariant(workspaceId, params.productId, params.variantId);
+  if (!product) {
+    return { ok: false, error: 'Product not found in this workspace' };
+  }
+
+  const newStock = Math.max(0, params.newStock);
+  let stockBefore = 0;
+  let reservedBefore = 0;
+
+  if (variant) {
+    stockBefore = Number(variant.stock_quantity) || 0;
+    reservedBefore = Number(variant.reserved_stock) || 0;
+    variant.stock_quantity = newStock;
+    variant.availability = newStock > 0 ? 'InStock' : 'OutOfStock';
+  } else {
+    stockBefore = Number(product.stock_quantity) || 0;
+    reservedBefore = Number(product.reserved_stock) || 0;
+    product.stock_quantity = newStock;
+    product.availability = newStock > 0 ? 'InStock' : 'OutOfStock';
+  }
+
+  if (Array.isArray(product.variants) && product.variants.length > 0) {
+    product.stock_quantity = product.variants.reduce((sum, v) => sum + (Number(v.stock_quantity) || 0), 0);
+    product.availability = product.stock_quantity > 0 ? 'InStock' : 'OutOfStock';
+  }
+
+  await saveWorkspaceProduct(workspaceId, product);
+
+  const movement: InventoryMovement = {
+    id: crypto.randomUUID ? crypto.randomUUID() : `mov-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+    workspace_id: workspaceId,
+    product_id: product.id,
+    variant_id: variant ? variant.id : null,
+    movement_type: 'manual_adjustment',
+    quantity: newStock - stockBefore,
+    stock_before: stockBefore,
+    stock_after: newStock,
+    reserved_before: reservedBefore,
+    reserved_after: reservedBefore,
+    reason: params.reason || 'Rettifica manuale giacenza',
+    actor: params.actor || 'system',
+    created_at: new Date().toISOString(),
+  };
+  await recordInventoryMovement(workspaceId, movement);
+
+  const available = Math.max(0, newStock - reservedBefore);
+  const threshold = Number(variant?.stock_threshold ?? product.stock_threshold ?? 5);
+  await checkAndNotifyStockThreshold(workspaceId, product, variant, available, threshold);
+
+  return { ok: true, product, movement };
+}
+
+export async function getWorkspaceInventorySummary(
+  workspaceId: string
+): Promise<WorkspaceInventorySummary> {
+  const products = await listWorkspaceProducts(workspaceId);
+  let totalSkus = 0;
+  let totalOnHandStock = 0;
+  let totalReservedStock = 0;
+  let lowStockCount = 0;
+  let outOfStockCount = 0;
+  let supplierOutOfStockCount = 0;
+
+  for (const p of products) {
+    if (Array.isArray(p.variants) && p.variants.length > 0) {
+      for (const v of p.variants) {
+        totalSkus++;
+        const onHand = Number(v.stock_quantity) || 0;
+        const reserved = Number(v.reserved_stock) || 0;
+        const available = Math.max(0, onHand - reserved);
+        const threshold = Number(v.stock_threshold ?? p.stock_threshold ?? 5);
+
+        totalOnHandStock += onHand;
+        totalReservedStock += reserved;
+        if (available <= 0) {
+          outOfStockCount++;
+        } else if (available <= threshold) {
+          lowStockCount++;
+        }
+
+        if (
+          v.supplier_availability === 'OutOfStock' ||
+          (v.supplier_stock !== null && v.supplier_stock !== undefined && v.supplier_stock <= 0)
+        ) {
+          supplierOutOfStockCount++;
+        }
+      }
+    } else {
+      totalSkus++;
+      const onHand = Number(p.stock_quantity) || 0;
+      const reserved = Number(p.reserved_stock) || 0;
+      const available = Math.max(0, onHand - reserved);
+      const threshold = Number(p.stock_threshold ?? 5);
+
+      totalOnHandStock += onHand;
+      totalReservedStock += reserved;
+      if (available <= 0) {
+        outOfStockCount++;
+      } else if (available <= threshold) {
+        lowStockCount++;
+      }
+
+      if (
+        p.supplier_availability === 'OutOfStock' ||
+        (p.supplier_stock !== null && p.supplier_stock !== undefined && p.supplier_stock <= 0)
+      ) {
+        supplierOutOfStockCount++;
+      }
+    }
+  }
+
+  const totalAvailableStock = Math.max(0, totalOnHandStock - totalReservedStock);
+
+  return {
+    totalSkus,
+    totalOnHandStock,
+    totalReservedStock,
+    totalAvailableStock,
+    lowStockCount,
+    outOfStockCount,
+    supplierOutOfStockCount,
+  };
+}
+
 

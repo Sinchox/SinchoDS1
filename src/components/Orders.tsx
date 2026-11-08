@@ -108,6 +108,7 @@ export const Orders: React.FC<OrdersProps> = ({
   const [returnReasonVal, setReturnReasonVal] = useState<string>('Prodotto non conforme o reso cliente');
   const [refundAmountVal, setRefundAmountVal] = useState<number>(0);
   const [refundReasonVal, setRefundReasonVal] = useState<string>('Rimborso per reso');
+  const [restockableVal, setRestockableVal] = useState<boolean>(true);
 
   // New Order Line Items Form State
   const [orderBuyerName, setOrderBuyerName] = useState<string>('');
@@ -365,11 +366,15 @@ export const Orders: React.FC<OrdersProps> = ({
   };
 
   // Select Catalog Product for a Line Item
-  const handleSelectCatalogProduct = (index: number, productId: string) => {
+  const handleSelectCatalogProduct = (index: number, productId: string, variantId?: string) => {
     const p = products.find((prod) => prod.id === productId);
     if (!p) return;
 
-    const variant = p.variants?.[0];
+    let variant = p.variants?.find((v) => v.id === variantId);
+    if (!variant && p.variants && p.variants.length > 0) {
+      variant = p.variants[0];
+    }
+
     const cost = Number(variant?.price ?? p.price) || 0;
     const sell = Math.round(cost * 1.35 * 100) / 100;
 
@@ -385,6 +390,28 @@ export const Orders: React.FC<OrdersProps> = ({
       supplier_id: p.supplier_id || 'pluspower',
       supplier_name: p.supplier_name || 'PlusPower Supplements',
       supplier_url: p.url,
+    });
+  };
+
+  // Select Catalog Variant for an existing Line Item
+  const handleSelectCatalogVariant = (index: number, variantId: string) => {
+    const currentItem = orderItems[index];
+    if (!currentItem || !currentItem.product_id) return;
+    const p = products.find((prod) => prod.id === currentItem.product_id);
+    if (!p) return;
+    const variant = p.variants?.find((v) => v.id === variantId);
+    if (!variant) return;
+
+    const cost = Number(variant.price ?? p.price) || 0;
+    const sell = Math.round(cost * 1.35 * 100) / 100;
+
+    handleUpdateLineItem(index, {
+      variant_id: variant.id,
+      variant_name: variant.name,
+      sku: variant.sku || currentItem.sku || p.sku || '',
+      ean: variant.ean || currentItem.ean || p.ean || '',
+      purchase_cost: cost,
+      selling_price: sell,
     });
   };
 
@@ -518,6 +545,7 @@ export const Orders: React.FC<OrdersProps> = ({
     setReturnReasonVal(order.return_reason || '');
     setRefundAmountVal(0);
     setRefundReasonVal('Rimborso reso cliente');
+    setRestockableVal(true);
   };
 
   // Submit Return
@@ -528,6 +556,8 @@ export const Orders: React.FC<OrdersProps> = ({
       await onRecordReturn(returnRefundOrder.id, {
         return_status: returnStatusVal,
         return_reason: returnReasonVal,
+        restockable: restockableVal,
+        restock_items: restockableVal,
         returned_at: new Date().toISOString(),
       });
       if (refundAmountVal > 0) {
@@ -1278,24 +1308,109 @@ export const Orders: React.FC<OrdersProps> = ({
 
                       {/* Select product from catalog shortcut */}
                       {products.length > 0 && (
-                        <div>
-                          <label className="text-[10px] text-slate-500 block mb-0.5">
-                            Carica da catalogo prodotti (compila costi &amp; prezzi suggeriti):
-                          </label>
-                          <select
-                            onChange={(e) => handleSelectCatalogProduct(idx, e.target.value)}
-                            defaultValue=""
-                            className="w-full bg-slate-900 border border-slate-800 rounded-lg p-1.5 text-xs text-slate-300"
-                          >
-                            <option value="" disabled>
-                              -- Seleziona un prodotto dal catalogo --
-                            </option>
-                            {products.map((p) => (
-                              <option key={p.id} value={p.id}>
-                                {p.title} ({p.supplier_name || 'PlusPower'}) - €{Number(p.price).toFixed(2)}
-                              </option>
-                            ))}
-                          </select>
+                        <div className="space-y-2 bg-slate-900/60 p-2.5 rounded-lg border border-slate-800/80">
+                          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1">
+                            <label className="text-[11px] font-semibold text-slate-300 flex items-center gap-1.5">
+                              <Package className="w-3.5 h-3.5 text-blue-400" />
+                              Carica da Catalogo Prodotti:
+                            </label>
+                            {item.product_id && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  handleUpdateLineItem(idx, {
+                                    product_id: undefined,
+                                    variant_id: undefined,
+                                  })
+                                }
+                                className="text-[10px] text-slate-400 hover:text-slate-200 underline text-left"
+                              >
+                                Svincola (inserimento manuale libero)
+                              </button>
+                            )}
+                          </div>
+
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                            <div>
+                              <select
+                                value={item.product_id || ''}
+                                onChange={(e) => handleSelectCatalogProduct(idx, e.target.value)}
+                                className="w-full bg-slate-900 border border-slate-700/80 rounded-lg p-1.5 text-xs text-slate-200"
+                              >
+                                <option value="">-- Seleziona Prodotto --</option>
+                                {products.map((p) => (
+                                  <option key={p.id} value={p.id}>
+                                    {p.title} ({p.supplier_name || 'PlusPower'}) - €{Number(p.price).toFixed(2)}
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
+
+                            {/* Variant picker if selected product has variants */}
+                            {(() => {
+                              const selectedProd = products.find((p) => p.id === item.product_id);
+                              if (!selectedProd || !selectedProd.variants || selectedProd.variants.length === 0) {
+                                return null;
+                              }
+                              return (
+                                <div>
+                                  <select
+                                    value={item.variant_id || (selectedProd.variants[0]?.id ?? '')}
+                                    onChange={(e) => handleSelectCatalogVariant(idx, e.target.value)}
+                                    className="w-full bg-slate-900 border border-slate-700/80 rounded-lg p-1.5 text-xs text-slate-200 font-medium"
+                                  >
+                                    {selectedProd.variants.map((v) => (
+                                      <option key={v.id} value={v.id}>
+                                        {v.name} (Giacenza: {v.stock_quantity ?? selectedProd.stock_quantity ?? 0} pz) - €{Number(v.price ?? selectedProd.price).toFixed(2)}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </div>
+                              );
+                            })()}
+                          </div>
+
+                          {/* Inventory Status & Alert */}
+                          {(() => {
+                            const selectedProd = products.find((p) => p.id === item.product_id);
+                            if (!selectedProd) return null;
+                            const selectedVariant =
+                              selectedProd.variants?.find((v) => v.id === item.variant_id) ||
+                              selectedProd.variants?.[0];
+                            const onHand = Number(selectedVariant?.stock_quantity ?? selectedProd.stock_quantity) || 0;
+                            const reserved = Number(selectedVariant?.reserved_stock ?? selectedProd.reserved_stock) || 0;
+                            const available = Math.max(0, onHand - reserved);
+                            const isDeficit = item.quantity > available;
+
+                            return (
+                              <div className="flex flex-wrap items-center justify-between text-[11px] pt-1.5 border-t border-slate-800/60">
+                                <div className="flex items-center space-x-2">
+                                  <span className="text-slate-400">
+                                    Giacenza: <strong className="text-white font-mono">{onHand}</strong>
+                                  </span>
+                                  <span className="text-slate-600">•</span>
+                                  <span className="text-amber-400">
+                                    Riservati: <strong className="font-mono">{reserved}</strong>
+                                  </span>
+                                  <span className="text-slate-600">•</span>
+                                  <span
+                                    className={
+                                      available > 0
+                                        ? 'text-emerald-400 font-bold'
+                                        : 'text-rose-400 font-bold'
+                                    }
+                                  >
+                                    Disponibili: <span className="font-mono">{available}</span>
+                                  </span>
+                                </div>
+                                {isDeficit && (
+                                  <span className="text-amber-400 font-medium text-[10px] bg-amber-500/10 border border-amber-500/20 px-2 py-0.5 rounded mt-1 sm:mt-0">
+                                    ⚠️ Richiesti ({item.quantity}) &gt; Disponibili ({available})
+                                  </span>
+                                )}
+                              </div>
+                            );
+                          })()}
                         </div>
                       )}
 
@@ -1907,6 +2022,24 @@ export const Orders: React.FC<OrdersProps> = ({
                   />
                 </div>
               )}
+
+              {/* Restock returned items checkbox */}
+              <div className="bg-slate-950/80 border border-slate-800 rounded-lg p-2.5">
+                <label className="flex items-start space-x-2 text-xs text-slate-300 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={restockableVal}
+                    onChange={(e) => setRestockableVal(e.target.checked)}
+                    className="mt-0.5 rounded border-slate-700 bg-slate-900 text-emerald-500 focus:ring-emerald-400"
+                  />
+                  <span>
+                    <strong className="text-white block font-semibold">Articolo integro e riassortibile in magazzino</strong>
+                    <span className="text-[11px] text-slate-400">
+                      Se attivo, ripristina le scorte a magazzino per le righe prodotto collegate dell'ordine e registra il movimento di reso.
+                    </span>
+                  </span>
+                </label>
+              </div>
             </div>
 
             <div className="flex items-center justify-end space-x-2 pt-2 border-t border-slate-800">

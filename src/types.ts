@@ -9,6 +9,10 @@ export interface ProductVariant {
   price?: string | number | null;
   original_price?: string | number | null;
   stock_quantity: number | null;
+  reserved_stock?: number | null;
+  stock_threshold?: number | null;
+  supplier_stock?: number | null;
+  supplier_availability?: 'InStock' | 'OutOfStock' | 'PreOrder' | string | null;
   availability: 'InStock' | 'OutOfStock' | 'PreOrder' | string | null;
   expiry_date?: string | null;
   available_online?: boolean | null;
@@ -35,6 +39,10 @@ export interface Product {
   ean?: string | null;
   availability?: 'InStock' | 'OutOfStock' | 'PreOrder' | string | null;
   stock_quantity?: number | null;
+  reserved_stock?: number | null;
+  stock_threshold?: number | null;
+  supplier_stock?: number | null;
+  supplier_availability?: 'InStock' | 'OutOfStock' | 'PreOrder' | string | null;
   description?: string | null;
   ingredients?: string | null;
   nutrition?: string | null;
@@ -540,6 +548,10 @@ export interface Order {
   events?: OrderEvent[];
   notes?: string | null;
 
+  // Phase 1.7: Inventory Movement Flags (Idempotency)
+  inventory_reserved?: boolean;
+  inventory_deducted?: boolean;
+
   created_at: string;
   updated_at?: string;
 }
@@ -725,4 +737,62 @@ export interface FinancialReport {
   supplierComparisons: SupplierCostBreakdown[];
   lossMakingOrders: LossMakingOrder[];
   cancellationAnalysis: CancellationAnalysis;
+}
+
+// ==============================================================================
+// Phase 1.7: Inventory Synchronization & Movement Models
+// ==============================================================================
+
+export type InventoryMovementType =
+  | 'reservation'         // Order created: active reservation incremented
+  | 'reservation_release' // Order cancelled before shipment: reservation released
+  | 'deduction'           // Order shipped: reservation cleared, on-hand decremented
+  | 'return_restock'      // Order returned and marked restockable: on-hand incremented
+  | 'manual_adjustment'   // Manual stock edit
+  | 'monitoring_sync';    // Supplier stock info updated without altering on-hand
+
+export interface InventoryMovement {
+  id: string;
+  workspace_id: string;
+  product_id: string;
+  variant_id?: string | null;
+  order_id?: string | null;
+  movement_type: InventoryMovementType;
+  quantity: number; // positive or negative
+  stock_before: number;
+  stock_after: number;
+  reserved_before: number;
+  reserved_after: number;
+  reason?: string;
+  actor?: string;
+  created_at: string;
+}
+
+export interface VariantStockStatus {
+  productId: string;
+  variantId?: string | null;
+  sku?: string;
+  productTitle: string;
+  variantName?: string;
+  supplierId: string;
+  supplierName: string;
+  onHandStock: number;
+  reservedStock: number;
+  availableStock: number;
+  threshold: number;
+  isLowStock: boolean;
+  isOutOfStock: boolean;
+  supplierStock?: number | null;
+  supplierAvailability?: string | null;
+  isSupplierOutOfStock: boolean;
+}
+
+export interface WorkspaceInventorySummary {
+  totalSkus: number;
+  totalOnHandStock: number;
+  totalReservedStock: number;
+  totalAvailableStock: number;
+  lowStockCount: number;
+  outOfStockCount: number;
+  supplierOutOfStockCount: number;
 }

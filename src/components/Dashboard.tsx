@@ -89,6 +89,42 @@ export const Dashboard: React.FC<DashboardProps> = ({
   const totalOrderRevenue = orderList.reduce((acc, o) => acc + (Number(o.total_paid) || 0), 0);
   const totalOrderNetProfit = orderList.reduce((acc, o) => acc + (Number(o.net_profit) || 0), 0);
 
+  // Phase 1.7 Inventory & Stock Metrics
+  const totalCatalogStockOnHand = products.reduce((acc, p) => {
+    if (p.variants && p.variants.length > 0) {
+      return acc + p.variants.reduce((vAcc, v) => vAcc + (v.stock_quantity || 0), 0);
+    }
+    return acc + (p.stock_quantity || 0);
+  }, 0);
+
+  const totalCatalogStockReserved = products.reduce((acc, p) => {
+    if (p.variants && p.variants.length > 0) {
+      return acc + p.variants.reduce((vAcc, v) => vAcc + (v.reserved_stock || 0), 0);
+    }
+    return acc + (p.reserved_stock || 0);
+  }, 0);
+
+  const totalCatalogStockAvailable = Math.max(0, totalCatalogStockOnHand - totalCatalogStockReserved);
+
+  let lowStockProductsCount = 0;
+  let outOfStockProductsCount = 0;
+  products.forEach((p) => {
+    const threshold = p.stock_threshold ?? 5;
+    const onHand = p.variants?.length
+      ? p.variants.reduce((acc, v) => acc + (v.stock_quantity || 0), 0)
+      : (p.stock_quantity ?? 0);
+    const reserved = p.variants?.length
+      ? p.variants.reduce((acc, v) => acc + (v.reserved_stock || 0), 0)
+      : (p.reserved_stock ?? 0);
+    const avail = Math.max(0, onHand - reserved);
+
+    if (avail === 0) {
+      outOfStockProductsCount++;
+    } else if (avail <= threshold) {
+      lowStockProductsCount++;
+    }
+  });
+
   const recentProducts = [...products]
     .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
     .slice(0, 5);
@@ -463,6 +499,89 @@ export const Dashboard: React.FC<DashboardProps> = ({
               <span>Ordini ({orderList.length})</span>
               <ArrowRight className="w-3.5 h-3.5" />
             </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Phase 1.7: Inventory & Stock Synchronization Overview */}
+      <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 sm:p-5 shadow-sm space-y-3">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-800 pb-3">
+          <div className="flex items-center space-x-2.5">
+            <div className="w-8 h-8 rounded-lg bg-blue-500/10 text-blue-400 flex items-center justify-center border border-blue-500/20">
+              <Package className="w-4 h-4" />
+            </div>
+            <div>
+              <div className="flex items-center space-x-2">
+                <h3 className="text-sm font-bold text-white tracking-tight">Giacenze Magazzino &amp; Sincronizzazione Catalogo</h3>
+                <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-400 border border-blue-500/30">
+                  Phase 1.7
+                </span>
+              </div>
+              <p className="text-[11px] text-slate-400">
+                Tracciamento scorte a magazzino, riserve attive su ordini in corso, scarichi automatici su spedizione e allarmi sottoscorta.
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={() => setCurrentPage('products')}
+            className="self-start sm:self-auto text-xs font-semibold px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors inline-flex items-center space-x-1.5"
+          >
+            <span>Gestisci Prodotti &amp; Scorte</span>
+            <ArrowRight className="w-3.5 h-3.5 text-blue-400" />
+          </button>
+        </div>
+
+        <div className="grid grid-cols-2 sm:grid-cols-5 gap-2.5 sm:gap-3">
+          <div className="p-3 rounded-xl bg-slate-800/40 border border-slate-800">
+            <span className="text-[11px] text-slate-400 font-medium">Giacenza Totale</span>
+            <div className="text-xl font-bold text-white mt-1 font-mono">
+              {totalCatalogStockOnHand} <span className="text-xs font-normal text-slate-400">pz</span>
+            </div>
+            <span className="text-[10px] text-slate-500">Unità a magazzino</span>
+          </div>
+
+          <div className="p-3 rounded-xl bg-slate-800/40 border border-slate-800">
+            <span className="text-[11px] text-amber-400 font-medium">Scorte Riservate</span>
+            <div className="text-xl font-bold text-amber-300 mt-1 font-mono">
+              {totalCatalogStockReserved} <span className="text-xs font-normal text-amber-500/80">pz</span>
+            </div>
+            <span className="text-[10px] text-slate-500">Ordini in attesa evasione</span>
+          </div>
+
+          <div className="p-3 rounded-xl bg-slate-800/40 border border-slate-800">
+            <span className="text-[11px] text-emerald-400 font-medium">Scorte Disponibili</span>
+            <div
+              className={`text-xl font-bold mt-1 font-mono ${
+                totalCatalogStockAvailable > 0 ? 'text-emerald-300' : 'text-rose-400'
+              }`}
+            >
+              {totalCatalogStockAvailable} <span className="text-xs font-normal text-slate-400">pz</span>
+            </div>
+            <span className="text-[10px] text-slate-500">Vendibili senza ritardi</span>
+          </div>
+
+          <div className="p-3 rounded-xl bg-slate-800/40 border border-slate-800">
+            <span className="text-[11px] text-amber-400 font-medium">Allarmi Sottoscorta</span>
+            <div
+              className={`text-xl font-bold mt-1 font-mono ${
+                lowStockProductsCount > 0 ? 'text-amber-400' : 'text-slate-300'
+              }`}
+            >
+              {lowStockProductsCount}
+            </div>
+            <span className="text-[10px] text-slate-500">&le; soglia di sicurezza</span>
+          </div>
+
+          <div className="p-3 rounded-xl bg-slate-800/40 border border-slate-800">
+            <span className="text-[11px] text-rose-400 font-medium">Prodotti Esauriti</span>
+            <div
+              className={`text-xl font-bold mt-1 font-mono ${
+                outOfStockProductsCount > 0 ? 'text-rose-400' : 'text-slate-300'
+              }`}
+            >
+              {outOfStockProductsCount}
+            </div>
+            <span className="text-[10px] text-slate-500">0 unità disponibili</span>
           </div>
         </div>
       </div>
